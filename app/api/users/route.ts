@@ -313,13 +313,19 @@ export async function POST(req: NextRequest) {
   }
 }
 
-// PATCH — cambiar rol, activar-desactivar y/o nombre de usuario:
-// { id, role?, banned?, username? }.
+// PATCH — cambiar rol, activar-desactivar, nombre de usuario y
+// restablecer contraseña:
+// { id, role?, banned?, username? } o { id, action: "reset_password", password }.
 // banned true desactiva el acceso (ban de 10 años); false lo reactiva.
-// No se puede cambiar el rol, desactivar ni eliminar la propia cuenta ni
-// la del admin principal. El nombre de usuario SÍ se puede asignar o
-// cambiar en cualquier cuenta (incluida la propia y la del admin
-// principal), porque es solo un alias para entrar, no un permiso.
+// Restablecer la contraseña pone la contraseña nueva con
+// admin.updateUserById: el usuario entra de inmediato con ella, sin
+// confirmar nada por correo, y NO reactiva a un usuario desactivado.
+// No se puede cambiar el rol, desactivar, eliminar ni restablecer la
+// contraseña de la propia cuenta ni la del admin principal (esa se
+// cambia desde Supabase, Authentication → Users). El nombre de usuario
+// SÍ se puede asignar o cambiar en cualquier cuenta (incluida la propia
+// y la del admin principal), porque es solo un alias para entrar, no un
+// permiso.
 export async function PATCH(req: NextRequest) {
   const caller = await callerIsAdmin(req);
   if (!caller) return forbidden();
@@ -328,6 +334,29 @@ export async function PATCH(req: NextRequest) {
   const body = await req.json().catch(() => ({}));
   const id = String(body.id || "");
   if (!id) return bad("Falta el id del usuario.");
+  // Restablecer contraseña: { id, action: "reset_password", password }.
+  if (body.action === "reset_password") {
+    const password = String(body.password || "");
+    if (password.length < 6)
+      return bad("La nueva contraseña debe tener al menos 6 caracteres.");
+    if (id === caller.id)
+      return bad("Tu propia contraseña no se puede restablecer desde aquí: cámbiala desde Supabase (Authentication → Users).");
+    try {
+      const { data: target, error: getErr } = await admin.auth.admin.getUserById(id);
+      if (getErr || !target.user) return bad("Usuario no encontrado.", 404);
+      if (target.user.email?.toLowerCase() === ADMIN_EMAIL)
+        return bad("La contraseña de la cuenta admin principal no se puede restablecer desde aquí: cámbiala desde Supabase (Authentication → Users).");
+      const { error } = await admin.auth.admin.updateUserById(id, { password });
+      if (error) {
+        if (error.message.toLowerCase().includes("password"))
+          return supabaseError("La contraseña no es válida: debe tener al menos 6 caracteres.", 400);
+        return supabaseError("No se pudo restablecer la contraseña: " + error.message);
+      }
+      return NextResponse.json({ ok: true });
+    } catch (e: any) {
+      return supabaseError("No se pudo restablecer la contraseña: " + (e?.message || e));
+    }
+  }
   const hasRole = typeof body.role === "string";
   const hasBanned = typeof body.banned === "boolean";
   const hasUsername = typeof body.username === "string";

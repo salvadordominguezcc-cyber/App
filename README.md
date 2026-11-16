@@ -252,12 +252,21 @@ cajero; el admin les puede subir el rol desde la pestaña Usuarios.
   - **Desactivar / Activar:** bloquea el acceso al POS (ban) o lo
     reactiva. Un usuario desactivado no puede entrar aunque tenga su
     contraseña.
+  - **Restablecer contraseña:** botón por usuario (excepto la propia
+    cuenta y la del admin principal): pide la contraseña nueva (mín. 6
+    caracteres, con confirmación) y la guarda con
+    `admin.updateUserById`. El usuario entra de inmediato con su usuario
+    o correo y la contraseña nueva, sin confirmar nada por correo. Sirve
+    para cuentas con correo real y para las de solo usuario (correo
+    interno `@elrodeo.local`). Restablecer la contraseña NO reactiva a
+    un usuario desactivado. La contraseña de la propia cuenta y la del
+    admin principal se cambia desde Supabase (Authentication → Users).
   - **Eliminar:** con confirmación; borra la cuenta de Supabase Auth.
-  - No se puede cambiar el rol, desactivar ni eliminar la propia
-    cuenta ni la del admin principal desde la pestaña. El nombre de
-    usuario SÍ se puede asignar o cambiar en cualquier cuenta (incluida
-    la propia y la del admin principal), porque es solo un alias para
-    entrar, no un permiso.
+  - No se puede cambiar el rol, desactivar, eliminar ni restablecer la
+    contraseña de la propia cuenta ni la del admin principal desde la
+    pestaña. El nombre de usuario SÍ se puede asignar o cambiar en
+    cualquier cuenta (incluida la propia y la del admin principal),
+    porque es solo un alias para entrar, no un permiso.
   - Errores en español y en claro: correo duplicado ("Ya existe un
     usuario con ese correo"), contraseña corta, sesión expirada, etc.
 

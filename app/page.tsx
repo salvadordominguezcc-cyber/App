@@ -111,6 +111,10 @@ export default function POS() {
   const [usersBusy, setUsersBusy] = useState(false);
   const [nuevoUsuario, setNuevoUsuario] = useState({ email: "", password: "", role: "cajero", username: "" });
   const [editUsername, setEditUsername] = useState<Record<string, string>>({});
+  // Restablecer contraseña por usuario: { pass, confirm } solo mientras
+  // el formulario está abierto. La contraseña nueva nunca se muestra en
+  // la lista ni se guarda en ningún lado; solo viaja a /api/users.
+  const [resetPass, setResetPass] = useState<Record<string, { pass: string; confirm: string }>>({});
   // Gastos del día (salidas de caja). Sin stock ni inventario.
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [expenseStatus, setExpenseStatus] = useState<"idle" | "loading" | "ok" | "missing" | "error">("idle");
@@ -460,6 +464,26 @@ async function load() {
       setMsg(`Usuario ${u.email} eliminado.`);
     } catch (e: any) {
       setUsersError(e.message || "No se pudo eliminar el usuario.");
+    } finally { setUsersBusy(false); }
+  }
+
+  // Restablecer la contraseña olvidada de un usuario (solo admin, nunca
+  // la propia cuenta ni la del admin principal: eso lo bloquea también
+  // la ruta). El usuario entra de inmediato con la contraseña nueva;
+  // si estaba desactivado, sigue desactivado.
+  async function restablecerContrasena(u: AppUser) {
+    const f = resetPass[u.id] || { pass: "", confirm: "" };
+    if (f.pass.length < 6) { setUsersError("La nueva contraseña debe tener al menos 6 caracteres."); return; }
+    if (f.pass !== f.confirm) { setUsersError("Las contraseñas no coinciden. Escríbelas igual en los dos campos."); return; }
+    const quien = u.username ? `@${u.username}` : (u.email || "este usuario");
+    if (!window.confirm(`¿Restablecer la contraseña de ${quien}? La contraseña anterior dejará de funcionar de inmediato.`)) return;
+    setUsersBusy(true); setUsersError("");
+    try {
+      await usersApi("PATCH", { id: u.id, action: "reset_password", password: f.pass });
+      setResetPass((v) => { const n = { ...v }; delete n[u.id]; return n; });
+      setMsg(`Contraseña de ${quien} restablecida. Ya puede entrar con su usuario o correo y la contraseña nueva.`);
+    } catch (e: any) {
+      setUsersError(e.message || "No se pudo restablecer la contraseña.");
     } finally { setUsersBusy(false); }
   }
 
@@ -1286,7 +1310,17 @@ async function load() {
                         </select>
                         <button className="btn sec" disabled={usersBusy || esYo || esAdminPrincipal} onClick={() => toggleBloqueoUsuario(u)}>{bloqueado ? "Activar" : "Desactivar"}</button>
                         <button className="btn sec" disabled={usersBusy || esYo || esAdminPrincipal} onClick={() => eliminarUsuario(u)}>Eliminar</button>
+                        <button className="btn sec" disabled={usersBusy || esYo || esAdminPrincipal} onClick={() => setResetPass((v) => ({ ...v, [u.id]: { pass: "", confirm: "" } }))}>Restablecer contraseña</button>
                       </div>
+                      {resetPass[u.id] !== undefined && (
+                        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8, alignItems: "center" }}>
+                          <input style={{ maxWidth: 200 }} type="password" placeholder="Nueva contraseña (mín. 6)" value={resetPass[u.id].pass} onChange={(e) => setResetPass((v) => ({ ...v, [u.id]: { ...v[u.id], pass: e.target.value } }))} />
+                          <input style={{ maxWidth: 200 }} type="password" placeholder="Confirmar contraseña" value={resetPass[u.id].confirm} onChange={(e) => setResetPass((v) => ({ ...v, [u.id]: { ...v[u.id], confirm: e.target.value } }))} />
+                          <button className="btn" disabled={usersBusy} onClick={() => restablecerContrasena(u)}>Guardar nueva contraseña</button>
+                          <button className="btn sec" disabled={usersBusy} onClick={() => setResetPass((v) => { const n = { ...v }; delete n[u.id]; return n; })}>Cancelar</button>
+                          <span className="muted">Entra de inmediato con la contraseña nueva. Si estaba desactivado, sigue desactivado.</span>
+                        </div>
+                      )}
                     </div>
                   );
                 })}
