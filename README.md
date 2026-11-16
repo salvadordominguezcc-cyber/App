@@ -7,6 +7,7 @@ POS standalone de EL RODEO para usar fuera de Muse con link público.
 - Catálogo: agregar, editar y quitar productos del menú. Sin stock: las ventas ya NO descuentan stock ni crean movimientos de inventario.
 - Gastos: registrar gastos del día (descripción, monto, categoría) y ver el total del día. Se descuentan del efectivo esperado en el corte de caja. Ver "Gastos" abajo.
 - Login por persona (Supabase Auth, email + contraseña), bitácora de accesos (solo admin) y gestión de usuarios con roles admin / cajero (solo admin). Ver "Login y bitácora" y "Usuarios y roles" abajo.
+- Modo sin internet: vender y registrar gastos sin señal; todo se guarda en el equipo y se sincroniza solo al volver la conexión. Ver "Modo sin internet" abajo.
 - Corte de caja: apertura con fondo, resumen por método de pago, esperado vs. contado, sobrante/faltante, historial.
 - Reportes: totales, ventas de hoy, ventas por producto.
 - Personalizar: nombre EL RODEO, eslogan, emoji de logo, color, tema, datos del negocio (dirección, teléfono, correo, RFC, horario, mensaje de ticket, fondo inicial).
@@ -55,6 +56,57 @@ create table if not exists public.expenses (
 -- llave anon pueda insertar, leer y eliminar gastos:
 alter table public.expenses disable row level security;
 ```
+
+## Modo sin internet
+
+- **Detección:** la app usa `navigator.onLine` y los eventos `online` /
+  `offline` del navegador. El header muestra **"🟢 En línea"** o
+  **"🔴 Sin internet — modo offline"**, más el contador de registros
+  pendientes de sincronizar (`⏳ N pendientes`) y un botón **"Sincronizar
+  ahora"** cuando hay pendientes y ya hay señal.
+- **Cola offline:** cuando no hay internet (o se cae la red a mitad de un
+  cobro/gasto/corte), la venta, el gasto o el corte se guarda en una cola
+  persistente en el navegador (**localStorage**, clave
+  `elrodeo_offline_queue`, ver `lib/offline.ts`) con un id temporal único
+  (uuid generado en el cliente). La cola **sobrevive a cerrar y reabrir
+  el navegador**. En Ventas, Gastos y Corte los pendientes se muestran
+  marcados con **"⏳ pendiente de sincronizar"**.
+- **Sincronización automática:** al volver la conexión (evento `online`)
+  y también al cargar la app con sesión, la cola se envía a Supabase
+  **en orden, uno por uno**. Cada registro se quita de la cola **solo
+  cuando Supabase confirma el insert**; si uno falla, se queda en cola y
+  la sincronización se detiene ahí para no alterar el orden, y se
+  reintenta sola la próxima vez. Al final la app avisa cuántos se
+  sincronizaron y si quedó alguno pendiente.
+- **Regla de folios (sin duplicados):** una venta offline **no tiene
+  folio** en pantalla (se muestra como "Pendiente"). El folio definitivo
+  se asigna **al sincronizar**, leyendo el folio máximo real de la tabla
+  `sales` en Supabase y sumando 1, y se vuelve a leer antes de cada
+  venta por si otra terminal vendió mientras tanto. Así dos ventas
+  nunca chocan con el mismo folio, aunque se hayan hecho sin internet
+  en equipos distintos. Al sincronizar, la venta pendiente toma su
+  folio definitivo en pantalla.
+- **Corte de caja:** el efectivo esperado ya incluye las ventas en
+  efectivo y los gastos **pendientes** del día (son parte de lo que hay
+  en caja aunque aún no estén en Supabase). El corte muestra una línea
+  "⏳ Aún sin sincronizar" con cuánto del esperado todavía vive solo en
+  el equipo. Si el corte mismo se cierra sin internet, también va a la
+  cola offline y se sincroniza después.
+- **Con internet todo sigue igual que antes:** ventas, gastos y cortes
+  van directo a Supabase como siempre; el modo offline solo entra en
+  acción cuando falla la red. No toca el login, los roles ni la pestaña
+  Usuarios, y no necesita la llave service_role.
+- **Límites (importante):**
+  - Los pendientes viven **solo en ese navegador / dispositivo** hasta
+    sincronizar. Si se borra el caché o los datos del navegador (o se
+    desinstala) antes de sincronizar, **los pendientes se pierden**.
+  - Cada terminal tiene su propia cola: lo vendido sin internet en un
+    celular no se ve en otro equipo hasta que el primero sincroniza.
+  - El menú (catálogo) y los datos del negocio no se pueden cambiar sin
+    internet: para vender offline el POS usa el menú y los precios ya
+    cargados en ese navegador.
+  - El login sí necesita internet la primera vez (la sesión se restaura
+    sin internet si ya estaba iniciada en ese navegador).
 
 ## Login y bitácora
 

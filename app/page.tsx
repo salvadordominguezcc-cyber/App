@@ -1,13 +1,20 @@
 "use client";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { supabase, supabaseConfigured, fmt } from "../lib/supabase";
 import { SEED_PRODUCTS, SEED_SETTINGS, Product } from "../lib/menu";
+import {
+  OfflineItem,
+  loadQueue,
+  enqueueOffline,
+  removeOffline,
+  isNetworkError,
+} from "../lib/offline";
 
 type Line = { product: Product; qty: number };
-type Sale = { id: string; folio: number; total_cents: number; payment_method: string; created_at: string; items?: { product_name: string; quantity: number; subtotal_cents: number }[] };
-type Cut = { id: string; opening_cents: number; expected_cents: number; counted_cents: number; difference_cents: number; created_at: string; status: string };
+type Sale = { id: string; folio: number | null; total_cents: number; payment_method: string; created_at: string; pending?: boolean; items?: { product_name: string; quantity: number; subtotal_cents: number }[] };
+type Cut = { id: string; opening_cents: number; expected_cents: number; counted_cents: number; difference_cents: number; created_at: string; status: string; pending?: boolean };
 type AccessLog = { id: string; user_id: string | null; user_email: string | null; action: string; created_at: string };
-type Expense = { id: string; description: string; amount_cents: number; category: string | null; created_at: string };
+type Expense = { id: string; description: string; amount_cents: number; category: string | null; created_at: string; pending?: boolean };
 type SessionUser = { id: string; email: string; role: "admin" | "cajero" };
 type AppUser = { id: string; email: string | null; role: "admin" | "cajero"; created_at: string; last_sign_in_at: string | null; banned_until: string | null };
 
@@ -71,6 +78,14 @@ export default function POS() {
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [expenseStatus, setExpenseStatus] = useState<"idle" | "loading" | "ok" | "missing" | "error">("idle");
   const [gasto, setGasto] = useState({ description: "", amount: "", category: "Insumos" });
+  // Modo sin internet: la cola offline vive en localStorage (clave
+  // "elrodeo_offline_queue", ver lib/offline.ts) y sobrevive al cerrar y
+  // reabrir el navegador. Los registros pendientes se muestran en Ventas /
+  // Gastos / Corte marcados como "pendiente de sincronizar".
+  const [online, setOnline] = useState(true);
+  const [queue, setQueue] = useState<OfflineItem[]>([]);
+  const [syncing, setSyncing] = useState(false);
+  const syncingRef = useRef(false);
 
   const isAdmin = !!user && user.role === "admin";
   const visibleTabs = (isAdmin ? ADMIN_TABS : BASE_TABS) as readonly string[];
@@ -104,6 +119,111 @@ export default function POS() {
       }
     }
     setLoading(false);
+    // Los pendientes offline se restauran encima de los datos de Supabase.
+    restorePending();
+    // Con internet, intenta sincronizar la cola pendiente al cargar.
+    if (typeof navigator === "undefined" || navigator.onLine !== false) void syncQueue();
+  }
+  // --- Modo sin internet ---
+  // Restaura los pendientes de la cola (localStorage) dentro del estado en
+  // pantalla, para que las ventas/gastos/cortes offline se vean en Ventas,
+  // Gastos y Corte aunque se haya cerrado y reabierto el navegador. Los
+  // pendientes se agregan al principio y no duplican nada de Supabase (su
+  // id es el tempId, distinto de cualquier uuid de Supabase).
+  function restorePending() {
+    const q = loadQueue();
+    setQueue(q);
+    if (!q.length) return;
+    const pendingSales: Sale[] = q
+      .filter((x): x is Extract<OfflineItem, { kind: "sale" }> => x.kind === "sale")
+      .map((x) => ({
+        id: x.tempId, folio: null, total_cents: x.total_cents, payment_method: x.payment_method,
+        created_at: x.created_at, pending: true,
+        items: x.items.map((i) => ({ product_name: i.product_name, quantity: i.quantity, subtotal_cents: i.subtotal_cents })),
+      }));
+    const pendingExpenses: Expense[] = q
+      .filter((x): x is Extract<OfflineItem, { kind: "expense" }> => x.kind === "expense")
+      .map((x) => ({
+        id: x.tempId, description: x.description, amount_cents: x.amount_cents, category: x.category,
+        created_at: x.created_at, pending: true,
+      }));
+    const pendingCuts: Cut[] = q
+      .filter((x): x is Extract<OfflineItem, { kind: "cut" }> => x.kind === "cut")
+      .map((x) => ({
+        id: x.tempId, opening_cents: x.opening_cents, expected_cents: x.expected_cents, counted_cents: x.counted_cents,
+        difference_cents: x.difference_cents, created_at: x.created_at, status: x.status, pending: true,
+      }));
+    if (pendingSales.length) setSales((s) => [...pendingSales, ...s.filter((y) => !pendingSales.some((p) => p.id === y.id))]);
+    if (pendingExpenses.length) setExpenses((e) => [...pendingExpenses, ...e.filter((y) => !pendingExpenses.some((p) => p.id === y.id))]);
+    if (pendingCuts.length) setCuts((c) => [...pendingCuts, ...c.filter((y) => !pendingCuts.some((p) => p.id === y.id))]);
+  }
+  // Sincronización: envía la cola a Supabase en orden, uno por uno. Cada
+  // registro se quita de la cola SOLO cuando Supabase confirma el insert;
+  // si uno falla (sigue sin internet u otro error), se queda en cola y la
+  // sincronización se detiene ahí para no alterar el orden.
+  // Regla de folios: la venta offline NO tiene folio en pantalla
+  // ("Pendiente"); el folio definitivo se asigna AQUÍ, en el momento de
+  // sincronizar, leyendo el folio máximo real de Supabase y sumando 1, y
+  // se vuelve a leer antes de cada venta por si otra terminal vendió
+  // mientras tanto. Así nunca chocan dos ventas con el mismo folio.
+  async function syncQueue() {
+    if (!supabase || syncingRef.current) return;
+    const q = loadQueue();
+    if (!q.length) { setQueue([]); return; }
+    if (typeof navigator !== "undefined" && navigator.onLine === false) return;
+    syncingRef.current = true;
+    setSyncing(true);
+    let synced = 0;
+    let failed = false;
+    for (const item of q) {
+      try {
+        if (item.kind === "sale") {
+          const { data: maxRow } = await supabase.from("sales").select("folio").order("folio", { ascending: false }).limit(1).maybeSingle();
+          const folio = (maxRow?.folio || 0) + 1;
+          const { data: inserted, error } = await supabase.from("sales").insert({
+            folio, total_cents: item.total_cents, payment_method: item.payment_method,
+            customer_name: item.customer_name, notes: null, status: "completada",
+          }).select("id").single();
+          if (error) throw error;
+          const saleId = inserted.id;
+          const { error: itemsErr } = await supabase.from("sale_items").insert(item.items.map((i) => ({
+            sale_id: saleId, product_id: i.product_id, product_name: i.product_name,
+            quantity: i.quantity, price_cents: i.price_cents, subtotal_cents: i.subtotal_cents,
+          })));
+          if (itemsErr) {
+            // Borra la venta huérfana para que el reintento no la duplique.
+            await supabase.from("sales").delete().eq("id", saleId);
+            throw itemsErr;
+          }
+          setSales((s) => s.map((y) => (y.id === item.tempId ? { ...y, id: saleId, folio, pending: false } : y)));
+        } else if (item.kind === "expense") {
+          const { data, error } = await supabase.from("expenses").insert({
+            description: item.description, amount_cents: item.amount_cents, category: item.category,
+          }).select("id").single();
+          if (error) throw error;
+          setExpenses((e) => e.map((y) => (y.id === item.tempId ? { ...y, id: data.id, pending: false } : y)));
+        } else {
+          const { data, error } = await supabase.from("cash_cuts").insert({
+            opening_cents: item.opening_cents, expected_cents: item.expected_cents, counted_cents: item.counted_cents,
+            difference_cents: item.difference_cents, status: item.status, notes: null,
+          }).select("id").single();
+          if (error) throw error;
+          setCuts((c) => c.map((y) => (y.id === item.tempId ? { ...y, id: data.id, pending: false } : y)));
+        }
+        setQueue(removeOffline(item.tempId));
+        synced++;
+      } catch (e) {
+        failed = true;
+        console.warn("No se pudo sincronizar un registro offline:", e);
+        break;
+      }
+    }
+    syncingRef.current = false;
+    setSyncing(false);
+    const remaining = loadQueue().length;
+    if (synced > 0 && remaining === 0) setMsg(`✓ Se sincronizaron ${synced} ${synced === 1 ? "registro" : "registros"} pendientes: ya están guardados en Supabase.`);
+    else if (synced > 0) setMsg(`Se sincronizaron ${synced} registros. Quedan ${remaining} pendientes: se reintentan solos al volver la señal.`);
+    else if (failed) setMsg("No se pudo sincronizar todavía: los registros siguen guardados en este equipo y se reintentan solos al volver la señal.");
   }
   // Registra un acceso en access_log. Si la tabla aún no existe (o el insert
   // falla por cualquier motivo), NO bloquea el login/logout: solo avisa en
@@ -281,6 +401,20 @@ export default function POS() {
     })();
   }, []);
   useEffect(() => { if (user) load(); }, [user]);
+  // Detección de conexión: navigator.onLine + eventos online/offline.
+  // Al volver la señal se intenta sincronizar la cola automáticamente.
+  useEffect(() => {
+    if (typeof navigator !== "undefined") setOnline(navigator.onLine);
+    setQueue(loadQueue());
+    const onOnline = () => { setOnline(true); void syncQueue(); };
+    const onOffline = () => setOnline(false);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    return () => {
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+    };
+  }, []);
   // Si el usuario pierde acceso a la pestaña actual (por ejemplo, el admin
   // le cambió el rol a cajero), se le regresa a Ventas.
   useEffect(() => {
@@ -299,8 +433,30 @@ export default function POS() {
 
   async function cobrar() {
     if (!ticket.length) return;
-    const folio = (sales.length ? Math.max(...sales.map((s) => s.folio || 0)) : 0) + 1;
-    const sale: Sale = { id: crypto.randomUUID(), folio, total_cents: total, payment_method: pay, created_at: new Date().toISOString(), items: ticket.map((l) => ({ product_name: l.product.name, quantity: l.qty, subtotal_cents: Math.round(l.product.price_cents * l.qty) })) };
+    // Folio: solo de las ventas YA sincronizadas (sin pendientes, que aún
+    // no tienen folio). El folio definitivo de una venta offline se asigna
+    // al sincronizar (ver syncQueue).
+    const syncedSales = sales.filter((s) => !s.pending);
+    const folio = (syncedSales.length ? Math.max(...syncedSales.map((s) => s.folio || 0)) : 0) + 1;
+    const itemsPayload = ticket.map((l) => ({
+      product_id: l.product.id.startsWith("seed-") ? null : l.product.id, // uuid real o null si es semilla
+      product_name: l.product.name, quantity: l.qty,
+      price_cents: l.product.price_cents, subtotal_cents: Math.round(l.product.price_cents * l.qty),
+    }));
+    const tempId = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+    const itemsForState = itemsPayload.map((i) => ({ product_name: i.product_name, quantity: i.quantity, subtotal_cents: i.subtotal_cents }));
+    // Sin internet: la venta va a la cola offline con folio pendiente y se
+    // muestra marcada como tal. Se sincroniza sola al volver la señal.
+    if (supabase && (!online || (typeof navigator !== "undefined" && navigator.onLine === false))) {
+      const sale: Sale = { id: tempId, folio: null, total_cents: total, payment_method: pay, created_at: createdAt, pending: true, items: itemsForState };
+      setSales((s) => [sale, ...s]);
+      setQueue(enqueueOffline({ kind: "sale", tempId, total_cents: total, payment_method: pay, customer_name: customer || null, created_at: createdAt, items: itemsPayload }));
+      setMsg(`Venta por ${fmt(total)} guardada sin internet: queda pendiente en este equipo y se sincroniza sola al volver la señal.`);
+      setTicket([]); setCash(""); setCustomer("");
+      return;
+    }
+    const sale: Sale = { id: tempId, folio, total_cents: total, payment_method: pay, created_at: createdAt, items: itemsForState };
     setSales((s) => [sale, ...s]);
     if (supabase) {
       // Nunca se envía el id local como uuid: Supabase genera el uuid de la venta.
@@ -308,16 +464,20 @@ export default function POS() {
         folio, total_cents: total, payment_method: pay,
         customer_name: customer || null, notes: null, status: "completada",
       }).select("id").single();
-      if (error) { setMsg("Venta guardada en pantalla, pero Supabase respondió: " + error.message); }
-      else {
+      if (error) {
+        if (isNetworkError(error)) {
+          // Se cayó la red a mitad del cobro: a la cola, sin folio aún.
+          setSales((s) => s.map((y) => (y.id === tempId ? { ...y, folio: null, pending: true } : y)));
+          setQueue(enqueueOffline({ kind: "sale", tempId, total_cents: total, payment_method: pay, customer_name: customer || null, created_at: createdAt, items: itemsPayload }));
+          setMsg(`Venta por ${fmt(total)} guardada sin internet: queda pendiente en este equipo y se sincroniza sola al volver la señal.`);
+        } else {
+          setMsg("Venta guardada en pantalla, pero Supabase respondió: " + error.message);
+        }
+      } else {
         const saleId = inserted.id; // uuid real de Supabase
-        const items = ticket.map((l) => ({
-          sale_id: saleId,
-          product_id: l.product.id.startsWith("seed-") ? null : l.product.id, // uuid real o null si es semilla
-          product_name: l.product.name, quantity: l.qty,
-          price_cents: l.product.price_cents, subtotal_cents: Math.round(l.product.price_cents * l.qty),
-        }));
+        const items = itemsPayload.map((i) => ({ sale_id: saleId, ...i }));
         await supabase.from("sale_items").insert(items);
+        setSales((s) => s.map((y) => (y.id === tempId ? { ...y, id: saleId } : y)));
         setMsg(`Venta #${folio} por ${fmt(total)} guardada en Supabase.`);
       }
     } else {
@@ -367,19 +527,41 @@ export default function POS() {
   async function agregarGasto() {
     const amount = Math.round(parseFloat(gasto.amount || "0") * 100);
     if (!gasto.description.trim() || !amount || amount <= 0) { setMsg("Para registrar un gasto escribe la descripción y el monto."); return; }
-    const exp: Expense = { id: crypto.randomUUID(), description: gasto.description.trim(), amount_cents: amount, category: gasto.category, created_at: new Date().toISOString() };
+    const tempId = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+    // Sin internet: el gasto va a la cola offline y se muestra pendiente.
+    if (supabase && (!online || (typeof navigator !== "undefined" && navigator.onLine === false))) {
+      const exp: Expense = { id: tempId, description: gasto.description.trim(), amount_cents: amount, category: gasto.category, created_at: createdAt, pending: true };
+      setExpenses((xs) => [exp, ...xs]);
+      setQueue(enqueueOffline({ kind: "expense", tempId, description: exp.description, amount_cents: amount, category: exp.category, created_at: createdAt }));
+      setGasto({ description: "", amount: "", category: "Insumos" });
+      setMsg(`Gasto de ${fmt(amount)} guardado sin internet: queda pendiente en este equipo y se sincroniza solo al volver la señal.`);
+      return;
+    }
+    const exp: Expense = { id: tempId, description: gasto.description.trim(), amount_cents: amount, category: gasto.category, created_at: createdAt };
     setExpenses((xs) => [exp, ...xs]);
     setGasto({ description: "", amount: "", category: "Insumos" });
     if (supabase) {
       const { data, error } = await supabase.from("expenses").insert({ description: exp.description, amount_cents: amount, category: exp.category }).select("id").single();
-      if (error) setMsg("Gasto guardado en pantalla, pero Supabase respondió: " + error.message + " Crea la tabla expenses con el SQL de README.md.");
-      else { setExpenses((xs) => xs.map((x) => (x.id === exp.id ? { ...x, id: data.id } : x))); setMsg(`Gasto de ${fmt(amount)} registrado.`); }
+      if (error) {
+        if (isNetworkError(error)) {
+          setExpenses((xs) => xs.map((x) => (x.id === tempId ? { ...x, pending: true } : x)));
+          setQueue(enqueueOffline({ kind: "expense", tempId, description: exp.description, amount_cents: amount, category: exp.category, created_at: createdAt }));
+          setMsg(`Gasto de ${fmt(amount)} guardado sin internet: queda pendiente en este equipo y se sincroniza solo al volver la señal.`);
+        } else {
+          setMsg("Gasto guardado en pantalla, pero Supabase respondió: " + error.message + " Crea la tabla expenses con el SQL de README.md.");
+        }
+      }
+      else { setExpenses((xs) => xs.map((x) => (x.id === tempId ? { ...x, id: data.id } : x))); setMsg(`Gasto de ${fmt(amount)} registrado.`); }
     } else setMsg(`Gasto de ${fmt(amount)} registrado en pantalla. Conecta Supabase para guardarlo en la nube.`);
   }
 
   async function eliminarGasto(e: Expense) {
     if (!window.confirm(`¿Eliminar el gasto "${e.description}" por ${fmt(e.amount_cents)}?`)) return;
     setExpenses((xs) => xs.filter((x) => x.id !== e.id));
+    // Si el gasto estaba pendiente en la cola offline, se quita de la cola
+    // también (nunca llegó a Supabase, así que no hay nada que borrar ahí).
+    if (e.pending) { setQueue(removeOffline(e.id)); setMsg("Gasto pendiente eliminado."); return; }
     // Solo se intenta borrar en Supabase si la tabla expenses existe
     // (si no, el gasto solo vivía en pantalla).
     if (supabase && expenseStatus === "ok") {
@@ -399,14 +581,41 @@ export default function POS() {
   // − gastos del día (las salidas de caja). Sin gastos queda igual que antes.
   const esperado = Math.round(fondo * 100) + efectivoHoy - totalGastosHoy;
   const totalVentas = sales.reduce((s, x) => s + x.total_cents, 0);
+  // Cuánto de lo de hoy aún no está sincronizado (ventas/gastos offline).
+  const pendientesHoy = useMemo(() => ({
+    ventasEfectivo: ventasHoy.filter((s) => s.pending && s.payment_method === "efectivo").reduce((s, x) => s + x.total_cents, 0),
+    gastos: gastosHoy.filter((e) => e.pending).reduce((s, x) => s + x.amount_cents, 0),
+  }), [ventasHoy, gastosHoy]);
 
   async function cerrarCorte() {
     const counted = Math.round(parseFloat(contado || "0") * 100);
-    const cut: Cut = { id: crypto.randomUUID(), opening_cents: Math.round(fondo * 100), expected_cents: esperado, counted_cents: counted, difference_cents: counted - esperado, created_at: new Date().toISOString(), status: counted === esperado ? "cuadrado" : "con diferencia" };
+    const tempId = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+    const cut: Cut = { id: tempId, opening_cents: Math.round(fondo * 100), expected_cents: esperado, counted_cents: counted, difference_cents: counted - esperado, created_at: createdAt, status: counted === esperado ? "cuadrado" : "con diferencia" };
+    // Sin internet: el corte también va a la cola offline (su esperado ya
+    // incluye las ventas y gastos pendientes del día) y se sincroniza solo.
+    if (supabase && (!online || (typeof navigator !== "undefined" && navigator.onLine === false))) {
+      setCuts((c) => [{ ...cut, pending: true }, ...c]);
+      setQueue(enqueueOffline({ kind: "cut", tempId, opening_cents: cut.opening_cents, expected_cents: cut.expected_cents, counted_cents: cut.counted_cents, difference_cents: cut.difference_cents, status: cut.status, created_at: createdAt }));
+      setMsg(`Corte cerrado sin internet: queda pendiente en este equipo y se sincroniza solo al volver la señal. Diferencia: ${fmt(cut.difference_cents)}.`);
+      setCajaAbierta(false); setContado("");
+      return;
+    }
     setCuts((c) => [cut, ...c]);
     if (supabase) {
-      const { error } = await supabase.from("cash_cuts").insert({ opening_cents: cut.opening_cents, expected_cents: cut.expected_cents, counted_cents: cut.counted_cents, difference_cents: cut.difference_cents, status: cut.status, notes: null });
-      setMsg(error ? "Corte guardado en pantalla, Supabase respondió: " + error.message : `Corte cerrado. Diferencia: ${fmt(cut.difference_cents)} — guardado en Supabase.`);
+      const { data, error } = await supabase.from("cash_cuts").insert({ opening_cents: cut.opening_cents, expected_cents: cut.expected_cents, counted_cents: cut.counted_cents, difference_cents: cut.difference_cents, status: cut.status, notes: null }).select("id").single();
+      if (error) {
+        if (isNetworkError(error)) {
+          setCuts((c) => c.map((y) => (y.id === tempId ? { ...y, pending: true } : y)));
+          setQueue(enqueueOffline({ kind: "cut", tempId, opening_cents: cut.opening_cents, expected_cents: cut.expected_cents, counted_cents: cut.counted_cents, difference_cents: cut.difference_cents, status: cut.status, created_at: createdAt }));
+          setMsg(`Corte cerrado sin internet: queda pendiente en este equipo y se sincroniza solo al volver la señal. Diferencia: ${fmt(cut.difference_cents)}.`);
+        } else {
+          setMsg("Corte guardado en pantalla, Supabase respondió: " + error.message);
+        }
+      } else {
+        if (data) setCuts((c) => c.map((y) => (y.id === tempId ? { ...y, id: data.id } : y)));
+        setMsg(`Corte cerrado. Diferencia: ${fmt(cut.difference_cents)} — guardado en Supabase.`);
+      }
     } else setMsg(`Corte cerrado. Diferencia: ${fmt(cut.difference_cents)} (solo en pantalla, sin Supabase).`);
     setCajaAbierta(false); setContado("");
   }
@@ -452,12 +661,21 @@ export default function POS() {
     <div style={{ ["--accent" as any]: settings.main_color || "#c2410c" }}>
       <header>
         <div><h1>{settings.logo_emoji} {settings.business_name}</h1><p>{settings.slogan} · Punto de venta</p></div>
-        <div style={{ textAlign: "right" }}><p>{supabaseConfigured ? "● Conectado a Supabase" : "○ Sin conexión a Supabase"}</p><p>{loading ? "Cargando…" : `${products.length} productos · ${sales.length} ventas`}</p><p className="muted">{user?.email} · {user?.role === "admin" ? "Admin" : "Cajero"}</p><button className="btn sec" onClick={salir}>Cerrar sesión</button></div>
+        <div style={{ textAlign: "right" }}>
+          <p>{online ? "🟢 En línea" : "🔴 Sin internet — modo offline"}{supabaseConfigured ? " · Conectado a Supabase" : " · Sin conexión a Supabase"}</p>
+          <p>{loading ? "Cargando…" : `${products.length} productos · ${sales.length} ventas`}{queue.length > 0 ? ` · ⏳ ${queue.length} ${queue.length === 1 ? "pendiente" : "pendientes"} de sincronizar` : ""}</p>
+          <p className="muted">{user?.email} · {user?.role === "admin" ? "Admin" : "Cajero"}</p>
+          {queue.length > 0 && online && (<button className="btn sec" onClick={() => void syncQueue()} disabled={syncing} style={{ marginRight: 8 }}>{syncing ? "Sincronizando…" : "Sincronizar ahora"}</button>)}
+          <button className="btn sec" onClick={salir}>Cerrar sesión</button>
+        </div>
       </header>
       {!supabaseConfigured && (
         <div className="banner">⚠️ Falta la llave anon de Supabase: el menú se muestra, pero las ventas no se guardan en la nube todavía. En Vercel agrega la variable <b>NEXT_PUBLIC_SUPABASE_ANON_KEY</b> con la llave “anon public” de Supabase (Settings → API) y vuelve a desplegar.</div>
       )}
       {supabaseConfigured && <div className="banner ok">✓ Conectado a Supabase: las ventas, los gastos y los cortes se guardan en la nube.</div>}
+      {!online && (
+        <div className="banner">🔴 Sin internet — modo offline: puedes seguir vendiendo y registrando gastos; todo se guarda en este equipo y se sincroniza solo al volver la señal.{queue.length > 0 ? ` Hay ${queue.length} ${queue.length === 1 ? "registro" : "registros"} pendientes de sincronizar.` : " Aún no hay registros pendientes."}</div>
+      )}
       <nav>{visibleTabs.map((t) => (<button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>{t}</button>))}</nav>
       <main>
         {msg && <p className="card" style={{ background: "#eff6ff" }}>{msg} <button className="btn sec" onClick={() => setMsg("")}>✕</button></p>}
@@ -484,7 +702,7 @@ export default function POS() {
               </div>
               <h2 style={{ marginTop: 20 }}>Ventas recientes</h2>
               {sales.slice(0, 10).map((s) => (
-                <div key={s.id} className="row"><span>#{s.folio} · {s.payment_method} · {new Date(s.created_at).toLocaleString("es-MX")}</span><b>{fmt(s.total_cents)}</b></div>
+                <div key={s.id} className="row"><span>{s.folio ? `#${s.folio}` : "Pendiente"} · {s.payment_method} · {new Date(s.created_at).toLocaleString("es-MX")}{s.pending ? " · ⏳ pendiente de sincronizar" : ""}</span><b>{fmt(s.total_cents)}</b></div>
               ))}
               {!sales.length && <p className="muted">Aún no hay ventas registradas.</p>}
             </div>
@@ -584,7 +802,7 @@ export default function POS() {
             {expenseStatus === "loading" && <p className="muted">Cargando gastos…</p>}
             {gastosHoy.map((e) => (
               <div key={e.id} className="row">
-                <span>{new Date(e.created_at).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit" })} · {e.description} · {e.category || "Otros"}</span>
+                <span>{new Date(e.created_at).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit" })} · {e.description} · {e.category || "Otros"}{e.pending ? " · ⏳ pendiente de sincronizar" : ""}</span>
                 <span><b>{fmt(e.amount_cents)}</b> <button className="btn sec" onClick={() => eliminarGasto(e)}>Eliminar</button></span>
               </div>
             ))}
@@ -606,6 +824,12 @@ export default function POS() {
                 <div className="row"><span>Fondo</span><b>{fmt(Math.round(fondo * 100))}</b></div>
                 <div className="row"><span>Ventas en efectivo hoy</span><b>{fmt(efectivoHoy)}</b></div>
                 <div className="row"><span>Gastos del día (salidas de caja)</span><b>− {fmt(totalGastosHoy)}</b></div>
+                {(pendientesHoy.ventasEfectivo > 0 || pendientesHoy.gastos > 0) && (
+                  <>
+                    <div className="row"><span>⏳ Aún sin sincronizar (incluido en lo esperado)</span><b>efectivo {fmt(pendientesHoy.ventasEfectivo)} − gastos {fmt(pendientesHoy.gastos)}</b></div>
+                    <p className="muted">El efectivo esperado ya incluye las ventas y gastos pendientes; esa parte aún no está guardada en Supabase, solo en este equipo.</p>
+                  </>
+                )}
                 <div className="row"><span>Ventas con tarjeta hoy</span><b>{fmt(tarjetaHoy)}</b></div>
                 <div className="row"><span>Ventas por transferencia hoy</span><b>{fmt(transfHoy)}</b></div>
                 <div className="row"><span>Efectivo esperado</span><b>{fmt(esperado)}</b></div>
@@ -617,7 +841,7 @@ export default function POS() {
               </div>
             )}
             <h2 style={{ marginTop: 20 }}>Historial de cortes</h2>
-            {cuts.map((c) => (<div key={c.id} className="row"><span>{new Date(c.created_at).toLocaleString("es-MX")} · {c.status}</span><b>Esperado {fmt(c.expected_cents)} · Contado {fmt(c.counted_cents)} · Dif. {fmt(c.difference_cents)}</b></div>))}
+            {cuts.map((c) => (<div key={c.id} className="row"><span>{new Date(c.created_at).toLocaleString("es-MX")} · {c.status}{c.pending ? " · ⏳ pendiente de sincronizar" : ""}</span><b>Esperado {fmt(c.expected_cents)} · Contado {fmt(c.counted_cents)} · Dif. {fmt(c.difference_cents)}</b></div>))}
             {!cuts.length && <p className="muted">Sin cortes todavía.</p>}
           </div>
         )}
