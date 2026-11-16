@@ -881,7 +881,7 @@ async function load() {
           <p>{loading ? "Cargando…" : `${products.length} productos · ${sales.length} ventas`}{queue.length > 0 ? ` · ⏳ ${queue.length} ${queue.length === 1 ? "pendiente" : "pendientes"} de sincronizar` : ""}</p>
           <p className="muted">{user?.username ? `@${user.username} · ` : ""}{user?.email} · {user?.role === "admin" ? "Admin" : "Cajero"}</p>
           {queue.length > 0 && online && (<button className="btn sec" onClick={() => void syncQueue()} disabled={syncing} style={{ marginRight: 8 }}>{syncing ? "Sincronizando…" : "Sincronizar ahora"}</button>)}
-          {installEvent && !isStandalone && (<button className="btn sec" onClick={instalarApp} style={{ marginRight: 8 }}>📲 Instalar app</button>)}
+          {installEvent && !isStandalone && (<button className="btn sec" onClick={instalarApp} style={{ marginRight: 8 }}>Instalar app</button>)}
           <button className="btn sec" onClick={salir}>Cerrar sesión</button>
         </div>
       </header>
@@ -1126,7 +1126,7 @@ async function load() {
             {isStandalone ? (
               <p className="card" style={{ background: "#eff6ff" }}>✅ Ya estás usando la app instalada.</p>
             ) : installEvent ? (
-              <button className="btn" onClick={instalarApp}>📲 Instalar app EL RODEO</button>
+              <button className="btn" onClick={instalarApp}>Instalar app EL RODEO</button>
             ) : (
               <div className="card" style={{ background: "#fffbeb" }}>
                 <p style={{ marginTop: 0 }}><b>Para instalarla desde el navegador:</b></p>
