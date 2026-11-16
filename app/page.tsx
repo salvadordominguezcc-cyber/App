@@ -5,17 +5,15 @@ import { SEED_PRODUCTS, SEED_SETTINGS, Product } from "../lib/menu";
 
 type Line = { product: Product; qty: number };
 type Sale = { id: string; folio: number; total_cents: number; payment_method: string; created_at: string; items?: { product_name: string; quantity: number; subtotal_cents: number }[] };
-type Movement = { id: string; product_name: string; type: string; quantity: number; reason: string; created_at: string };
 type Cut = { id: string; opening_cents: number; expected_cents: number; counted_cents: number; difference_cents: number; created_at: string; status: string };
 
-const TABS = ["Ventas", "Inventario", "Corte de caja", "Reportes", "Personalizar"] as const;
+const TABS = ["Ventas", "Catálogo", "Corte de caja", "Reportes", "Personalizar"] as const;
 
 export default function POS() {
   const [tab, setTab] = useState<(typeof TABS)[number]>("Ventas");
   const [products, setProducts] = useState<Product[]>(SEED_PRODUCTS);
   const [settings, setSettings] = useState<any>(SEED_SETTINGS);
   const [sales, setSales] = useState<Sale[]>([]);
-  const [movements, setMovements] = useState<Movement[]>([]);
   const [cuts, setCuts] = useState<Cut[]>([]);
   const [ticket, setTicket] = useState<Line[]>([]);
   const [pay, setPay] = useState("efectivo");
@@ -26,7 +24,8 @@ export default function POS() {
   const [cajaAbierta, setCajaAbierta] = useState(false);
   const [fondo, setFondo] = useState(500);
   const [contado, setContado] = useState("");
-  const [adj, setAdj] = useState<Record<string, { qty: string; type: string; reason: string }>>({});
+  const [nuevo, setNuevo] = useState({ name: "", price: "", unit: "pieza", description: "" });
+  const [edit, setEdit] = useState<Record<string, { name: string; price: string; unit: string; description: string }>>({});
 
   const total = ticket.reduce((s, l) => s + l.product.price_cents * l.qty, 0);
   const cambio = pay === "efectivo" && cash ? Math.max(0, Math.round(parseFloat(cash) * 100) - total) : 0;
@@ -34,14 +33,12 @@ export default function POS() {
   async function load() {
     setLoading(true);
     if (supabase) {
-      const { data: prods } = await supabase.from("products").select("*").eq("active", true).order("name");
-      if (prods?.length) setProducts(prods.map((p: any) => ({ ...p, stock: Number(p.stock ?? 0), min_stock: Number(p.min_stock ?? 0) })));
+      const { data: prods } = await supabase.from("products").select("*").order("name");
+      if (prods?.length) setProducts(prods.map((p: any) => ({ ...p, stock: 0, min_stock: 0 })));
       const { data: sett } = await supabase.from("settings").select("*").limit(1).maybeSingle();
       if (sett) setSettings({ ...SEED_SETTINGS, ...sett });
       const { data: s } = await supabase.from("sales").select("*, sale_items(product_name, quantity, subtotal_cents)").order("created_at", { ascending: false }).limit(50);
       if (s) setSales(s.map((x: any) => ({ ...x, items: x.sale_items })));
-      const { data: m } = await supabase.from("inventory_movements").select("*").order("created_at", { ascending: false }).limit(50);
-      if (m) setMovements(m);
       const { data: c } = await supabase.from("cash_cuts").select("*").order("created_at", { ascending: false }).limit(20);
       if (c) setCuts(c);
     }
@@ -62,11 +59,6 @@ export default function POS() {
     const folio = (sales.length ? Math.max(...sales.map((s) => s.folio || 0)) : 0) + 1;
     const sale: Sale = { id: crypto.randomUUID(), folio, total_cents: total, payment_method: pay, created_at: new Date().toISOString(), items: ticket.map((l) => ({ product_name: l.product.name, quantity: l.qty, subtotal_cents: Math.round(l.product.price_cents * l.qty) })) };
     setSales((s) => [sale, ...s]);
-    // Descuento de inventario en pantalla
-    setProducts((ps) => ps.map((p) => {
-      const line = ticket.find((l) => l.product.id === p.id);
-      return line ? { ...p, stock: Math.max(0, p.stock - line.qty) } : p;
-    }));
     if (supabase) {
       // Nunca se envía el id local como uuid: Supabase genera el uuid de la venta.
       const { data: inserted, error } = await supabase.from("sales").insert({
@@ -83,15 +75,6 @@ export default function POS() {
           price_cents: l.product.price_cents, subtotal_cents: Math.round(l.product.price_cents * l.qty),
         }));
         await supabase.from("sale_items").insert(items);
-        await supabase.from("inventory_movements").insert(ticket.map((l) => ({
-          product_id: l.product.id.startsWith("seed-") ? null : l.product.id,
-          product_name: l.product.name, type: "venta", quantity: -l.qty, reason: `Venta folio #${folio}`,
-        })));
-        for (const l of ticket) {
-          if (!l.product.id.startsWith("seed-")) {
-            await supabase.from("products").update({ stock: Math.max(0, l.product.stock - l.qty) }).eq("id", l.product.id);
-          }
-        }
         setMsg(`Venta #${folio} por ${fmt(total)} guardada en Supabase.`);
       }
     } else {
@@ -100,18 +83,40 @@ export default function POS() {
     setTicket([]); setCash(""); setCustomer("");
   }
 
-  async function ajustar(p: Product) {
-    const a = adj[p.id]; if (!a?.qty) return;
-    const qty = parseFloat(a.qty); if (!qty) return;
-    const delta = a.type === "merma" ? -qty : qty;
-    setProducts((ps) => ps.map((x) => (x.id === p.id ? { ...x, stock: Math.max(0, x.stock + delta) } : x)));
-    const mov: Movement = { id: crypto.randomUUID(), product_name: p.name, type: a.type, quantity: delta, reason: a.reason || a.type, created_at: new Date().toISOString() };
-    setMovements((m) => [mov, ...m]);
+  // Catálogo: agregar, editar y quitar productos del menú. Sin stock.
+  async function agregarProducto() {
+    const price = Math.round(parseFloat(nuevo.price || "0") * 100);
+    if (!nuevo.name.trim() || !price) { setMsg("Para agregar al menú escribe el nombre y el precio."); return; }
+    const prod: Product = { id: "seed-" + crypto.randomUUID(), name: nuevo.name.trim(), price_cents: price, unit: nuevo.unit, category: "", description: nuevo.description.trim(), stock: 0, min_stock: 0, active: true };
+    setProducts((ps) => [...ps, prod].sort((a, b) => a.name.localeCompare(b.name)));
+    setNuevo({ name: "", price: "", unit: "pieza", description: "" });
+    if (supabase) {
+      const { data, error } = await supabase.from("products").insert({ name: prod.name, price_cents: price, unit: prod.unit, category: "", description: prod.description, active: true }).select("id").single();
+      if (error) setMsg("Se agregó en pantalla, pero Supabase respondió: " + error.message);
+      else { setProducts((ps) => ps.map((p) => (p.id === prod.id ? { ...p, id: data.id } : p))); setMsg(`"${prod.name}" agregado al menú.`); }
+    } else setMsg(`"${prod.name}" agregado al menú en pantalla. Conecta Supabase para guardarlo en la nube.`);
+  }
+
+  async function guardarEdicion(p: Product) {
+    const e = edit[p.id]; if (!e) return;
+    const price = Math.round(parseFloat(e.price || "0") * 100);
+    if (!e.name.trim() || !price) { setMsg("El nombre y el precio no pueden quedar vacíos."); return; }
+    const upd = { ...p, name: e.name.trim(), price_cents: price, unit: e.unit, description: e.description.trim() };
+    setProducts((ps) => ps.map((x) => (x.id === p.id ? upd : x)));
+    setEdit((v) => { const n = { ...v }; delete n[p.id]; return n; });
     if (supabase && !p.id.startsWith("seed-")) {
-      await supabase.from("products").update({ stock: Math.max(0, p.stock + delta) }).eq("id", p.id);
-      await supabase.from("inventory_movements").insert({ product_id: p.id, product_name: p.name, type: a.type, quantity: delta, reason: a.reason || a.type });
-    }
-    setAdj((v) => ({ ...v, [p.id]: { qty: "", type: "entrada", reason: "" } }));
+      const { error } = await supabase.from("products").update({ name: upd.name, price_cents: price, unit: upd.unit, description: upd.description }).eq("id", p.id);
+      setMsg(error ? "No se pudo guardar en Supabase: " + error.message : `"${upd.name}" actualizado en el menú.`);
+    } else setMsg(`"${upd.name}" actualizado en pantalla.`);
+  }
+
+  async function toggleActivo(p: Product) {
+    const active = !p.active;
+    setProducts((ps) => ps.map((x) => (x.id === p.id ? { ...x, active } : x)));
+    if (supabase && !p.id.startsWith("seed-")) {
+      const { error } = await supabase.from("products").update({ active }).eq("id", p.id);
+      setMsg(error ? "No se pudo guardar en Supabase: " + error.message : active ? `"${p.name}" vuelve a estar en el menú.` : `"${p.name}" quitado del menú.`);
+    } else setMsg(active ? `"${p.name}" vuelve a estar en el menú.` : `"${p.name}" quitado del menú.`);
   }
 
   const ventasHoy = useMemo(() => sales.filter((s) => s.created_at.slice(0, 10) === new Date().toISOString().slice(0, 10)), [sales]);
@@ -153,7 +158,7 @@ export default function POS() {
       {!supabaseConfigured && (
         <div className="banner">⚠️ Falta la llave anon de Supabase: el menú se muestra, pero las ventas no se guardan en la nube todavía. En Vercel agrega la variable <b>NEXT_PUBLIC_SUPABASE_ANON_KEY</b> con la llave “anon public” de Supabase (Settings → API) y vuelve a desplegar.</div>
       )}
-      {supabaseConfigured && <div className="banner ok">✓ Conectado a Supabase: las ventas, el inventario y los cortes se guardan en la nube.</div>}
+      {supabaseConfigured && <div className="banner ok">✓ Conectado a Supabase: las ventas y los cortes se guardan en la nube.</div>}
       <nav>{TABS.map((t) => (<button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>{t}</button>))}</nav>
       <main>
         {msg && <p className="card" style={{ background: "#eff6ff" }}>{msg} <button className="btn sec" onClick={() => setMsg("")}>✕</button></p>}
@@ -168,7 +173,6 @@ export default function POS() {
                     <b>{p.name}</b>
                     <span className="price">{fmt(p.price_cents)}</span> <span className="unit">/ {p.unit}</span>
                     <div className="muted">{p.description}</div>
-                    <div className={p.stock <= p.min_stock ? "low" : "muted"}>Stock: {p.stock} {p.unit}</div>
                     {p.unit === "kg" ? (
                       <div className="qty">
                         <button onClick={() => addToTicket(p, 0.25)}>¼ kg</button>
@@ -207,25 +211,49 @@ export default function POS() {
           </div>
         )}
 
-        {tab === "Inventario" && (
+        {tab === "Catálogo" && (
           <div>
-            <h2>Inventario</h2>
-            {products.map((p) => (
-              <div key={p.id} className="card" style={{ marginBottom: 10 }}>
-                <div className="row"><span><b>{p.name}</b> · {fmt(p.price_cents)} / {p.unit}</span><span className={p.stock <= p.min_stock ? "low" : ""}>Stock: {p.stock} {p.unit}{p.stock <= p.min_stock ? " · ¡Existencia baja!" : ""}</span></div>
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                  <input style={{ maxWidth: 120 }} type="number" placeholder="Cantidad" value={adj[p.id]?.qty || ""} onChange={(e) => setAdj((v) => ({ ...v, [p.id]: { ...(v[p.id] || { type: "entrada", reason: "" }), qty: e.target.value } }))} />
-                  <select style={{ maxWidth: 160 }} value={adj[p.id]?.type || "entrada"} onChange={(e) => setAdj((v) => ({ ...v, [p.id]: { ...(v[p.id] || { qty: "", reason: "" }), type: e.target.value } }))}>
-                    <option value="entrada">Entrada</option><option value="merma">Merma</option><option value="ajuste">Ajuste</option>
-                  </select>
-                  <input style={{ flex: 1, minWidth: 140 }} placeholder="Motivo" value={adj[p.id]?.reason || ""} onChange={(e) => setAdj((v) => ({ ...v, [p.id]: { ...(v[p.id] || { qty: "", type: "entrada" }), reason: e.target.value } }))} />
-                  <button className="btn" onClick={() => ajustar(p)}>Registrar</button>
-                </div>
+            <h2>Catálogo — menú a utilizar</h2>
+            <p className="muted">Agrega productos al menú o quítalos. Lo que quites deja de aparecer en Ventas, pero no borra tus ventas anteriores.</p>
+            <div className="card" style={{ marginBottom: 16 }}>
+              <h2>Agregar al menú</h2>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <input style={{ flex: 2, minWidth: 160 }} placeholder="Nombre, ej. Taco de barbacoa" value={nuevo.name} onChange={(e) => setNuevo({ ...nuevo, name: e.target.value })} />
+                <input style={{ maxWidth: 130 }} type="number" placeholder="Precio $" value={nuevo.price} onChange={(e) => setNuevo({ ...nuevo, price: e.target.value })} />
+                <select style={{ maxWidth: 130 }} value={nuevo.unit} onChange={(e) => setNuevo({ ...nuevo, unit: e.target.value })}>
+                  <option value="pieza">pieza</option><option value="kg">kg</option><option value="litro">litro</option><option value="orden">orden</option>
+                </select>
+                <input style={{ flex: 2, minWidth: 160 }} placeholder="Descripción (opcional)" value={nuevo.description} onChange={(e) => setNuevo({ ...nuevo, description: e.target.value })} />
+                <button className="btn" onClick={agregarProducto}>Agregar</button>
               </div>
-            ))}
-            <h2>Movimientos</h2>
-            {movements.slice(0, 20).map((m) => (<div key={m.id} className="row"><span>{m.product_name} · {m.type} · {m.reason}</span><b>{m.quantity}</b></div>))}
-            {!movements.length && <p className="muted">Sin movimientos todavía.</p>}
+            </div>
+            {products.map((p) => {
+              const e = edit[p.id];
+              return (
+                <div key={p.id} className="card" style={{ marginBottom: 10, opacity: p.active ? 1 : 0.55 }}>
+                  <div className="row"><span><b>{p.name}</b> · {fmt(p.price_cents)} / {p.unit}{p.active ? "" : " · fuera del menú"}</span></div>
+                  {p.description && <div className="muted">{p.description}</div>}
+                  {e ? (
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                      <input style={{ flex: 2, minWidth: 140 }} value={e.name} onChange={(ev) => setEdit((v) => ({ ...v, [p.id]: { ...e, name: ev.target.value } }))} />
+                      <input style={{ maxWidth: 120 }} type="number" value={e.price} onChange={(ev) => setEdit((v) => ({ ...v, [p.id]: { ...e, price: ev.target.value } }))} />
+                      <select style={{ maxWidth: 120 }} value={e.unit} onChange={(ev) => setEdit((v) => ({ ...v, [p.id]: { ...e, unit: ev.target.value } }))}>
+                        <option value="pieza">pieza</option><option value="kg">kg</option><option value="litro">litro</option><option value="orden">orden</option>
+                      </select>
+                      <input style={{ flex: 2, minWidth: 140 }} placeholder="Descripción" value={e.description} onChange={(ev) => setEdit((v) => ({ ...v, [p.id]: { ...e, description: ev.target.value } }))} />
+                      <button className="btn" onClick={() => guardarEdicion(p)}>Guardar</button>
+                      <button className="btn sec" onClick={() => setEdit((v) => { const n = { ...v }; delete n[p.id]; return n; })}>Cancelar</button>
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                      <button className="btn sec" onClick={() => setEdit((v) => ({ ...v, [p.id]: { name: p.name, price: String(p.price_cents / 100), unit: p.unit, description: p.description || "" } }))}>Editar</button>
+                      <button className="btn sec" onClick={() => toggleActivo(p)}>{p.active ? "Quitar del menú" : "Volver al menú"}</button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {!products.length && <p className="muted">No hay productos en el catálogo todavía.</p>}
           </div>
         )}
 
