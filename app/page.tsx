@@ -106,6 +106,10 @@ export default function POS() {
   // esa venta, con product_id null en Supabase.
   const [showOtros, setShowOtros] = useState(false);
   const [otros, setOtros] = useState({ desc: "", amount: "", qty: "1" });
+  // Cantidad elegida por producto antes de agregarlo al ticket: empieza
+  // en 1, mínimo 1 y máximo 99. Solo para productos por pieza, litro u
+  // orden; la barbacoa por kilo conserva sus atajos de ¼, ½ y 1 kg.
+  const [pickQty, setPickQty] = useState<Record<string, number>>({});
   const [edit, setEdit] = useState<Record<string, { name: string; price: string; unit: string; description: string }>>({});
   // Login por persona (Supabase Auth) + bitácora de accesos (solo admin).
   const [user, setUser] = useState<SessionUser | null>(null);
@@ -687,6 +691,20 @@ async function load() {
     });
   }
 
+  // Ajustar la cantidad de un renglón del ticket: − y + (paso de 0.25
+  // para la barbacoa por kilo, 1 para los demás). Al bajar a 0 el
+  // renglón se quita. El subtotal y el total se recalculan solos.
+  function ajustarTicket(i: number, delta: number) {
+    setTicket((t) => {
+      const l = t[i];
+      if (!l) return t;
+      const step = l.product.unit === "kg" ? 0.25 : 1;
+      const qty = Math.round((l.qty + delta * step) * 100) / 100;
+      if (qty <= 0) return t.filter((_, j) => j !== i);
+      const n = [...t]; n[i] = { ...l, qty }; return n;
+    });
+  }
+
   // "Otros" con precio variable: se agrega al ticket como renglón
   // "Otros" (o "Otros: <descripción>") con el monto escrito. Cada vez
   // es un renglón nuevo (id único), así se puede cobrar varias veces en
@@ -1144,7 +1162,14 @@ async function load() {
                         <button onClick={() => addToTicket(p, 0.5)}>½ kg</button>
                         <button onClick={() => addToTicket(p, 1)}>1 kg</button>
                       </div>
-                    ) : (<div className="qty"><button onClick={() => addToTicket(p, 1)}>+ Agregar</button></div>)}
+                    ) : (
+                      <div className="qty">
+                        <button onClick={() => setPickQty((q) => ({ ...q, [p.id]: Math.max(1, (q[p.id] || 1) - 1) }))}>−</button>
+                        <b style={{ minWidth: 24, textAlign: "center", alignSelf: "center" }}>{pickQty[p.id] || 1}</b>
+                        <button onClick={() => setPickQty((q) => ({ ...q, [p.id]: Math.min(99, (q[p.id] || 1) + 1) }))}>+</button>
+                        <button onClick={() => { addToTicket(p, pickQty[p.id] || 1); setPickQty((q) => ({ ...q, [p.id]: 1 })); }}>+ Agregar</button>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -1184,7 +1209,11 @@ async function load() {
               {ticket.map((l, i) => (
                 <div key={i} className="row">
                   <span>{l.product.name} × {l.qty} {l.product.unit}</span>
-                  <span><b>{fmt(Math.round(l.product.price_cents * l.qty))}</b> <button className="btn sec" onClick={() => setTicket(ticket.filter((_, j) => j !== i))}>✕</button></span>
+                  <span style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                    <button className="btn sec" onClick={() => ajustarTicket(i, -1)}>−</button>
+                    <button className="btn sec" onClick={() => ajustarTicket(i, 1)}>+</button>
+                    <b>{fmt(Math.round(l.product.price_cents * l.qty))}</b> <button className="btn sec" onClick={() => setTicket(ticket.filter((_, j) => j !== i))}>✕</button>
+                  </span>
                 </div>
               ))}
               <div className="row"><span>Total</span><span className="big">{fmt(total)}</span></div>
