@@ -15,8 +15,8 @@ type Sale = { id: string; folio: number | null; total_cents: number; payment_met
 type Cut = { id: string; opening_cents: number; expected_cents: number; counted_cents: number; difference_cents: number; created_at: string; status: string; pending?: boolean };
 type AccessLog = { id: string; user_id: string | null; user_email: string | null; action: string; created_at: string };
 type Expense = { id: string; description: string; amount_cents: number; category: string | null; created_at: string; pending?: boolean };
-type SessionUser = { id: string; email: string; role: "admin" | "cajero" };
-type AppUser = { id: string; email: string | null; role: "admin" | "cajero"; created_at: string; last_sign_in_at: string | null; banned_until: string | null };
+type SessionUser = { id: string; email: string; role: "admin" | "cajero"; username: string | null };
+type AppUser = { id: string; email: string | null; username: string | null; role: "admin" | "cajero"; created_at: string; last_sign_in_at: string | null; banned_until: string | null };
 
 // Evento del navegador para instalar la PWA (Chrome/Android y Edge).
 // No existe en el tipado estándar, por eso se define aquí.
@@ -42,6 +42,13 @@ const ADMIN_EMAIL = "salvadordominguezcc@gmail.com";
 function roleOf(user: { user_metadata?: any } | null, email: string): "admin" | "cajero" {
   if (email.toLowerCase() === ADMIN_EMAIL) return "admin";
   return user?.user_metadata?.role === "admin" ? "admin" : "cajero";
+}
+
+// Nombre de usuario para entrar (opcional): se guarda en
+// user_metadata.username. Si no tiene, el login es solo por correo.
+function usernameOf(user: { user_metadata?: any } | null): string | null {
+  const u = String(user?.user_metadata?.username || "").trim().toLowerCase();
+  return u || null;
 }
 
 // Cajero: Ventas, Catálogo, Gastos, Corte de caja y Reportes.
@@ -80,7 +87,8 @@ export default function POS() {
   const [usersStatus, setUsersStatus] = useState<"idle" | "loading" | "ok" | "no-service-key" | "error">("idle");
   const [usersError, setUsersError] = useState("");
   const [usersBusy, setUsersBusy] = useState(false);
-  const [nuevoUsuario, setNuevoUsuario] = useState({ email: "", password: "", role: "cajero" });
+  const [nuevoUsuario, setNuevoUsuario] = useState({ email: "", password: "", role: "cajero", username: "" });
+  const [editUsername, setEditUsername] = useState<Record<string, string>>({});
   // Gastos del día (salidas de caja). Sin stock ni inventario.
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [expenseStatus, setExpenseStatus] = useState<"idle" | "loading" | "ok" | "missing" | "error">("idle");
@@ -99,6 +107,10 @@ export default function POS() {
   const [installEvent, setInstallEvent] = useState<BeforeInstallPromptEvent | null>(null);
   const [isStandalone, setIsStandalone] = useState(false);
   const [installMsg, setInstallMsg] = useState("");
+  // Logo del negocio (Personalizar, solo admin): imagen subida por el admin,
+  // guardada en settings.logo_url como data URL. El emoji (logo_emoji) queda
+  // solo como respaldo cuando no hay imagen subida.
+  const [logoMsg, setLogoMsg] = useState("");
 
   const isAdmin = !!user && user.role === "admin";
   const visibleTabs = (isAdmin ? ADMIN_TABS : BASE_TABS) as readonly string[];
@@ -106,13 +118,36 @@ export default function POS() {
   const total = ticket.reduce((s, l) => s + l.product.price_cents * l.qty, 0);
   const cambio = pay === "efectivo" && cash ? Math.max(0, Math.round(parseFloat(cash) * 100) - total) : 0;
 
-  async function load() {
+  // Datos del negocio en este equipo (localStorage): así el logo y el nombre
+// se siguen viendo sin internet, aunque Supabase no responda. La nube
+// sigue siendo la fuente principal cuando hay señal.
+const SETTINGS_CACHE_KEY = "elrodeo_settings";
+
+function guardarSettingsLocal(s: any) {
+  try {
+    if (typeof window !== "undefined") window.localStorage.setItem(SETTINGS_CACHE_KEY, JSON.stringify(s));
+  } catch { /* localStorage lleno o bloqueado: el logo solo vive en la nube */ }
+}
+
+function cargarSettingsLocal(): any | null {
+  try {
+    if (typeof window === "undefined") return null;
+    const raw = window.localStorage.getItem(SETTINGS_CACHE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+async function load() {
     setLoading(true);
+    // Sin internet, los datos del negocio (incluido el logo) se restauran
+    // desde este equipo; con internet, Supabase los actualiza enseguida.
+    const cachedSettings = cargarSettingsLocal();
+    if (cachedSettings) setSettings({ ...SEED_SETTINGS, ...cachedSettings });
     if (supabase) {
       const { data: prods } = await supabase.from("products").select("*").order("name");
       if (prods?.length) setProducts(prods.map((p: any) => ({ ...p, stock: 0, min_stock: 0 })));
       const { data: sett } = await supabase.from("settings").select("*").limit(1).maybeSingle();
-      if (sett) setSettings({ ...SEED_SETTINGS, ...sett });
+      if (sett) { setSettings({ ...SEED_SETTINGS, ...sett }); guardarSettingsLocal({ ...SEED_SETTINGS, ...sett }); }
       const { data: s } = await supabase.from("sales").select("*, sale_items(product_name, quantity, subtotal_cents)").order("created_at", { ascending: false }).limit(50);
       if (s) setSales(s.map((x: any) => ({ ...x, items: x.sale_items })));
       const { data: c } = await supabase.from("cash_cuts").select("*").order("created_at", { ascending: false }).limit(20);
@@ -310,14 +345,37 @@ export default function POS() {
     const email = nuevoUsuario.email.trim();
     if (!email || !nuevoUsuario.password) { setUsersError("Escribe el correo y la contraseña del nuevo usuario."); return; }
     const rol = nuevoUsuario.role;
+    const username = nuevoUsuario.username.trim().toLowerCase();
     setUsersBusy(true); setUsersError("");
     try {
-      await usersApi("POST", { email, password: nuevoUsuario.password, role: rol });
-      setNuevoUsuario({ email: "", password: "", role: "cajero" });
+      await usersApi("POST", { email, password: nuevoUsuario.password, role: rol, username: username || undefined });
+      setNuevoUsuario({ email: "", password: "", role: "cajero", username: "" });
       await cargarUsuarios();
-      setMsg(`Usuario ${email} creado con rol ${rol === "admin" ? "admin" : "cajero"}. Ya puede entrar al POS.`);
+      setMsg(`Usuario ${email} creado con rol ${rol === "admin" ? "admin" : "cajero"}${username ? ` y usuario @${username}` : ""}. Ya puede entrar al POS.`);
     } catch (e: any) {
       setUsersError(e.message || "No se pudo crear el usuario.");
+    } finally { setUsersBusy(false); }
+  }
+
+  // Asigna o cambia el nombre de usuario de una cuenta (también la propia
+  // y la del admin principal: es solo un alias para entrar, no un permiso).
+  // Dejar el campo vacío quita el usuario y el login queda solo por correo.
+  async function guardarUsuario(u: AppUser) {
+    const username = (editUsername[u.id] ?? u.username ?? "").trim().toLowerCase();
+    if (username && !/^[a-zA-Z0-9._]{3,}$/.test(username)) {
+      setUsersError("El nombre de usuario debe tener al menos 3 caracteres y solo puede usar letras, números, guion bajo (_) y punto (.), sin espacios.");
+      return;
+    }
+    setUsersBusy(true); setUsersError("");
+    try {
+      await usersApi("PATCH", { id: u.id, username });
+      // Si cambió su propio usuario, el header se actualiza solo.
+      if (u.id === user?.id) setUser((cur) => (cur ? { ...cur, username: username || null } : cur));
+      setEditUsername((v) => { const n = { ...v }; delete n[u.id]; return n; });
+      await cargarUsuarios();
+      setMsg(username ? `Nombre de usuario de ${u.email} cambiado a @${username}.` : `Nombre de usuario de ${u.email} quitado: ahora entra solo con su correo.`);
+    } catch (e: any) {
+      setUsersError(e.message || "No se pudo cambiar el nombre de usuario.");
     } finally { setUsersBusy(false); }
   }
 
@@ -360,26 +418,50 @@ export default function POS() {
     } finally { setUsersBusy(false); }
   }
 
+  // Entrar con correo o con nombre de usuario + contraseña. Si lo que se
+  // escribe lleva @, se usa directo como correo. Si no, se resuelve el
+  // usuario a su correo con GET /api/users?username= (la ruta devuelve
+  // SOLO el correo y el mismo error genérico si no existe, para no revelar
+  // si un usuario existe). La contraseña nunca viaja a esa ruta.
   async function entrar() {
     if (!supabase) { setLoginError("Supabase no está conectado: falta la llave anon en Vercel."); return; }
-    if (!loginEmail.trim() || !loginPass) { setLoginError("Escribe tu correo y tu contraseña."); return; }
+    if (!loginEmail.trim() || !loginPass) { setLoginError("Escribe tu correo o nombre de usuario y tu contraseña."); return; }
     setLoginLoading(true);
     setLoginError("");
+    let email = loginEmail.trim();
+    if (!email.includes("@")) {
+      const username = email.toLowerCase();
+      if (!/^[a-z0-9._]{3,}$/.test(username)) {
+        setLoginLoading(false);
+        setLoginError("Correo, nombre de usuario o contraseña incorrectos. Revisa tus datos e inténtalo de nuevo.");
+        return;
+      }
+      try {
+        const res = await fetch(`/api/users?username=${encodeURIComponent(username)}`);
+        const json = await res.json().catch(() => ({}));
+        if (!res.ok || !json.email) throw new Error(json.message || "");
+        email = String(json.email);
+      } catch {
+        setLoginLoading(false);
+        setLoginError("Correo, nombre de usuario o contraseña incorrectos. Revisa tus datos e inténtalo de nuevo.");
+        return;
+      }
+    }
     const { data, error } = await supabase.auth.signInWithPassword({
-      email: loginEmail.trim(), password: loginPass,
+      email, password: loginPass,
     });
     setLoginLoading(false);
     if (error || !data.user?.email) {
       setLoginError(
         error?.message === "Invalid login credentials"
-          ? "Correo o contraseña incorrectos. Revisa tus datos e inténtalo de nuevo."
+          ? "Correo, nombre de usuario o contraseña incorrectos. Revisa tus datos e inténtalo de nuevo."
           : error?.message === "Email not confirmed"
             ? "Tu correo aún no está confirmado. Revisa tu bandeja de entrada."
             : "No se pudo entrar: " + (error?.message || "inténtalo de nuevo."),
       );
       return;
     }
-    const u: SessionUser = { id: data.user.id, email: data.user.email, role: roleOf(data.user, data.user.email) };
+    const u: SessionUser = { id: data.user.id, email: data.user.email, role: roleOf(data.user, data.user.email), username: usernameOf(data.user) };
     setUser(u);
     setLoginPass("");
     await logAccess(u, "login");
@@ -405,7 +487,7 @@ export default function POS() {
         const { data } = await supabase.auth.getSession();
         const s = data.session?.user;
         if (s?.email) {
-          const u: SessionUser = { id: s.id, email: s.email, role: roleOf(s, s.email) };
+          const u: SessionUser = { id: s.id, email: s.email, role: roleOf(s, s.email), username: usernameOf(s) };
           setUser(u);
           if (u.role === "admin") await cargarBitacora();
         }
@@ -674,16 +756,88 @@ export default function POS() {
     setCajaAbierta(false); setContado("");
   }
 
+  // Logo del negocio: comprime la imagen en el navegador (canvas) a un
+  // máximo de 512×512 px y menos de 200 KB, y la devuelve como data URL
+  // (base64) para guardarla en settings.logo_url. El fondo se pinta de
+  // blanco para que los PNG con transparencia no queden con fondo negro.
+  function comprimirLogo(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(file);
+      const img = new Image();
+      img.onload = () => {
+        URL.revokeObjectURL(url);
+        const draw = (maxDim: number, quality: number): string => {
+          const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+          const w = Math.max(1, Math.round(img.width * scale));
+          const h = Math.max(1, Math.round(img.height * scale));
+          const canvas = document.createElement("canvas");
+          canvas.width = w; canvas.height = h;
+          const ctx = canvas.getContext("2d");
+          if (!ctx) throw new Error("canvas");
+          ctx.fillStyle = "#ffffff"; ctx.fillRect(0, 0, w, h);
+          ctx.drawImage(img, 0, 0, w, h);
+          return canvas.toDataURL("image/jpeg", quality);
+        };
+        try {
+          // Prueba calidades/tamaños hasta quedar en menos de 200 KB.
+          const intentos: Array<[number, number]> = [[512, 0.85], [512, 0.6], [256, 0.8], [256, 0.6]];
+          let data = "";
+          for (const [maxDim, q] of intentos) {
+            data = draw(maxDim, q);
+            if (data.length <= 200 * 1024 * 1.37) break;
+          }
+          resolve(data);
+        } catch { reject(new Error("No se pudo comprimir la imagen.")); }
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("No se pudo leer la imagen.")); };
+      img.src = url;
+    });
+  }
+
+  async function onLogoFile(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // permite volver a elegir el mismo archivo
+    if (!file) return;
+    if (!["image/jpeg", "image/png", "image/webp"].includes(file.type)) {
+      setLogoMsg("Ese archivo no es una imagen JPG, PNG o WebP.");
+      return;
+    }
+    if (file.size > 10 * 1024 * 1024) {
+      setLogoMsg("La imagen es muy pesada (máximo 10 MB antes de comprimir).");
+      return;
+    }
+    try {
+      const dataUrl = await comprimirLogo(file);
+      setSettings((s: any) => ({ ...s, logo_url: dataUrl }));
+      setLogoMsg("Imagen lista. Pulsa “Guardar datos del negocio” para aplicarla.");
+    } catch {
+      setLogoMsg("No se pudo leer esa imagen. Prueba con otra.");
+    }
+  }
+
+  function quitarLogo() {
+    setSettings((s: any) => ({ ...s, logo_url: "" }));
+    setLogoMsg("Imagen quitada. Pulsa “Guardar datos del negocio” para aplicar el cambio.");
+  }
+
   async function guardarSettings() {
+    // El logo (y el resto de datos) queda guardado en este equipo aunque
+    // no haya internet; con señal también se guarda en Supabase.
+    guardarSettingsLocal(settings);
     if (supabase) {
       const { error } = await supabase.from("settings").update({
         business_name: settings.business_name, slogan: settings.slogan, logo_emoji: settings.logo_emoji,
+        logo_url: settings.logo_url || null,
         main_color: settings.main_color, theme: settings.theme, address: settings.address, phone: settings.phone,
         whatsapp: settings.whatsapp, email: settings.email, rfc: settings.rfc, hours: settings.hours,
         ticket_message: settings.ticket_message, initial_cash_cents: settings.initial_cash_cents,
       }).eq("id", settings.id);
-      setMsg(error ? "No se pudo guardar en Supabase: " + error.message : "Datos del negocio guardados en Supabase.");
-    } else setMsg("Datos guardados en pantalla. Conecta la llave anon para guardarlos en Supabase.");
+      if (error) {
+        setMsg(isNetworkError(error)
+          ? "Datos guardados en este equipo (sin internet). Vuelve a pulsar Guardar con internet para que queden en la nube."
+          : "No se pudo guardar en Supabase: " + error.message);
+      } else setMsg("Datos del negocio guardados en Supabase.");
+    } else setMsg("Datos guardados en este equipo. Conecta la llave anon para guardarlos en Supabase.");
   }
 
   // Sin sesión no se muestra nada del POS: solo la pantalla de login.
@@ -693,13 +847,13 @@ export default function POS() {
   if (!user) {
     return (
       <div className="card" style={{ maxWidth: 420, margin: "80px auto" }}>
-        <h1>{SEED_SETTINGS.logo_emoji} {SEED_SETTINGS.business_name}</h1>
-        <p className="muted">Punto de venta · Entra con tu correo y contraseña.</p>
+        <h1><img src="/icon.svg" alt="Logo de EL RODEO" style={{ width: 48, height: 48, objectFit: "cover", borderRadius: "50%", verticalAlign: "middle", marginRight: 8 }} />{SEED_SETTINGS.business_name}</h1>
+        <p className="muted">Punto de venta · Entra con tu correo o tu nombre de usuario y tu contraseña.</p>
         {!supabaseConfigured && (
           <p className="banner">⚠️ Supabase no está conectado: falta la llave anon en Vercel. Sin conexión no se puede iniciar sesión.</p>
         )}
-        <label>Correo</label>
-        <input type="email" value={loginEmail} onChange={(e) => setLoginEmail(e.target.value)} placeholder="tu@correo.com" onKeyDown={(e) => { if (e.key === "Enter") entrar(); }} />
+        <label>Correo o nombre de usuario</label>
+        <input type="text" value={loginEmail} onChange={(e) => setLoginEmail(e.target.value)} placeholder="tu@correo.com o tu usuario" onKeyDown={(e) => { if (e.key === "Enter") entrar(); }} />
         <label>Contraseña</label>
         <input type="password" value={loginPass} onChange={(e) => setLoginPass(e.target.value)} placeholder="Tu contraseña" onKeyDown={(e) => { if (e.key === "Enter") entrar(); }} />
         {loginError && <p style={{ color: "#b91c1c" }}>{loginError}</p>}
@@ -714,11 +868,18 @@ export default function POS() {
   return (
     <div style={{ ["--accent" as any]: settings.main_color || "#c2410c" }}>
       <header>
-        <div><h1>{settings.logo_emoji} {settings.business_name}</h1><p>{settings.slogan} · Punto de venta</p></div>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          {settings.logo_url ? (
+            <img src={settings.logo_url} alt="Logo de EL RODEO" style={{ width: 48, height: 48, objectFit: "cover", borderRadius: "50%", background: "#fff", flexShrink: 0 }} />
+          ) : (
+            <img src="/icon.svg" alt="Logo de EL RODEO" style={{ width: 48, height: 48, objectFit: "cover", borderRadius: "50%", background: "#fff", flexShrink: 0 }} />
+          )}
+          <div><h1>{settings.business_name}</h1><p>{settings.slogan} · Punto de venta</p></div>
+        </div>
         <div style={{ textAlign: "right" }}>
           <p>{online ? "🟢 En línea" : "🔴 Sin internet — modo offline"}{supabaseConfigured ? " · Conectado a Supabase" : " · Sin conexión a Supabase"}</p>
           <p>{loading ? "Cargando…" : `${products.length} productos · ${sales.length} ventas`}{queue.length > 0 ? ` · ⏳ ${queue.length} ${queue.length === 1 ? "pendiente" : "pendientes"} de sincronizar` : ""}</p>
-          <p className="muted">{user?.email} · {user?.role === "admin" ? "Admin" : "Cajero"}</p>
+          <p className="muted">{user?.username ? `@${user.username} · ` : ""}{user?.email} · {user?.role === "admin" ? "Admin" : "Cajero"}</p>
           {queue.length > 0 && online && (<button className="btn sec" onClick={() => void syncQueue()} disabled={syncing} style={{ marginRight: 8 }}>{syncing ? "Sincronizando…" : "Sincronizar ahora"}</button>)}
           {installEvent && !isStandalone && (<button className="btn sec" onClick={instalarApp} style={{ marginRight: 8 }}>📲 Instalar app</button>)}
           <button className="btn sec" onClick={salir}>Cerrar sesión</button>
@@ -762,6 +923,12 @@ export default function POS() {
               {!sales.length && <p className="muted">Aún no hay ventas registradas.</p>}
             </div>
             <div className="card">
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8 }}>
+                {settings.logo_url && (
+                  <img src={settings.logo_url} alt="Logo de EL RODEO" style={{ width: 40, height: 40, objectFit: "cover", borderRadius: "50%", background: "#fff" }} />
+                )}
+                <div><b>{settings.business_name}</b><div className="muted">{settings.slogan}</div></div>
+              </div>
               <h2>Ticket</h2>
               {!ticket.length && <p className="muted">Toca un producto para agregarlo.</p>}
               {ticket.map((l, i) => (
@@ -925,8 +1092,18 @@ export default function POS() {
             <input value={settings.business_name} onChange={(e) => setSettings({ ...settings, business_name: e.target.value })} />
             <label>Eslogan</label>
             <input value={settings.slogan || ""} onChange={(e) => setSettings({ ...settings, slogan: e.target.value })} />
-            <label>Emoji del logo</label>
-            <input value={settings.logo_emoji || ""} onChange={(e) => setSettings({ ...settings, logo_emoji: e.target.value })} />
+            <label>Subir imagen del logo</label>
+            {settings.logo_url ? (
+              <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
+                <img src={settings.logo_url} alt="Vista previa del logo" style={{ width: 72, height: 72, objectFit: "cover", borderRadius: "50%", background: "#fff", border: "1px solid #ddd" }} />
+                <button className="btn sec" onClick={quitarLogo}>Quitar imagen</button>
+              </div>
+            ) : (
+              <p className="muted">Sin imagen subida: se muestra el logo por defecto {settings.logo_emoji || "🥩"}.</p>
+            )}
+            <input type="file" accept="image/jpeg,image/png,image/webp" onChange={onLogoFile} />
+            <p className="muted">JPG, PNG o WebP (máx. 10 MB). Se comprime a 512×512 px y menos de 200 KB. Recuerda pulsar “Guardar datos del negocio”. El icono de la app instalada en el celular no cambia desde aquí: es un archivo fijo de la app.</p>
+            {logoMsg && <p>{logoMsg}</p>}
             <label>Color principal</label>
             <input type="color" value={settings.main_color || "#c2410c"} onChange={(e) => setSettings({ ...settings, main_color: e.target.value })} />
             <label>Dirección</label>
@@ -1004,12 +1181,14 @@ export default function POS() {
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                     <input style={{ flex: 2, minWidth: 180 }} type="email" placeholder="Correo, ej. cajero@correo.com" value={nuevoUsuario.email} onChange={(e) => setNuevoUsuario({ ...nuevoUsuario, email: e.target.value })} />
                     <input style={{ flex: 1, minWidth: 140 }} type="password" placeholder="Contraseña (mín. 6 caracteres)" value={nuevoUsuario.password} onChange={(e) => setNuevoUsuario({ ...nuevoUsuario, password: e.target.value })} />
+                    <input style={{ flex: 1, minWidth: 140 }} placeholder="Usuario (opcional), ej. cajero1" value={nuevoUsuario.username} onChange={(e) => setNuevoUsuario({ ...nuevoUsuario, username: e.target.value })} />
                     <select style={{ maxWidth: 130 }} value={nuevoUsuario.role} onChange={(e) => setNuevoUsuario({ ...nuevoUsuario, role: e.target.value })}>
                       <option value="cajero">Cajero</option>
                       <option value="admin">Admin</option>
                     </select>
                     <button className="btn" onClick={crearUsuario} disabled={usersBusy}>{usersBusy ? "Creando…" : "Crear usuario"}</button>
                   </div>
+                  <p className="muted" style={{ marginBottom: 0 }}>El usuario es opcional: con él se puede entrar al POS sin escribir el correo. Solo letras, números, guion bajo (_) y punto (.), mínimo 3 caracteres, sin espacios.</p>
                   {usersError && <p style={{ color: "#b91c1c", marginTop: 8 }}>{usersError}</p>}
                 </div>
                 {appUsers.map((u) => {
@@ -1019,8 +1198,13 @@ export default function POS() {
                   return (
                     <div key={u.id} className="card" style={{ marginBottom: 10, opacity: bloqueado ? 0.6 : 1 }}>
                       <div className="row">
-                        <span><b>{u.email || "Sin correo"}</b> · {u.role === "admin" ? "Admin" : "Cajero"}{bloqueado ? " · ⛔ Desactivado" : ""}{esYo ? " · (tú)" : ""}</span>
+                        <span><b>{u.email || "Sin correo"}</b>{u.username ? ` · @${u.username}` : " · sin usuario"} · {u.role === "admin" ? "Admin" : "Cajero"}{bloqueado ? " · ⛔ Desactivado" : ""}{esYo ? " · (tú)" : ""}</span>
                         <span className="muted">Creado: {new Date(u.created_at).toLocaleDateString("es-MX")} · Último acceso: {u.last_sign_in_at ? new Date(u.last_sign_in_at).toLocaleString("es-MX") : "nunca"}</span>
+                      </div>
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8, alignItems: "center" }}>
+                        <input style={{ maxWidth: 180 }} placeholder="Usuario, ej. cajero1" value={editUsername[u.id] ?? u.username ?? ""} onChange={(e) => setEditUsername((v) => ({ ...v, [u.id]: e.target.value }))} />
+                        <button className="btn sec" disabled={usersBusy || (editUsername[u.id] ?? u.username ?? "") === (u.username ?? "")} onClick={() => guardarUsuario(u)}>Guardar usuario</button>
+                        <span className="muted">Vacío = entra solo con su correo.</span>
                       </div>
                       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
                         <select value={u.role} disabled={usersBusy || esYo || esAdminPrincipal} onChange={(e) => cambiarRolUsuario(u, e.target.value as "admin" | "cajero")}>

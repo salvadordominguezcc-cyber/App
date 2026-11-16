@@ -10,7 +10,7 @@ POS standalone de EL RODEO para usar fuera de Muse con link público.
 - Modo sin internet: vender y registrar gastos sin señal; todo se guarda en el equipo y se sincroniza solo al volver la conexión. Ver "Modo sin internet" abajo.
 - Corte de caja: apertura con fondo, resumen por método de pago, esperado vs. contado, sobrante/faltante, historial.
 - Reportes: totales, ventas de hoy, ventas por producto.
-- Personalizar: nombre EL RODEO, eslogan, emoji de logo, color, tema, datos del negocio (dirección, teléfono, correo, RFC, horario, mensaje de ticket, fondo inicial).
+- Personalizar: nombre EL RODEO, eslogan, imagen de logo (se sube en la pestaña), color, tema, datos del negocio (dirección, teléfono, correo, RFC, horario, mensaje de ticket, fondo inicial).
 
 ## Base de datos
 Supabase, proyecto `el-rodeo-pos` — https://hhrtiqdagnbdckdkoxih.supabase.co
@@ -56,6 +56,27 @@ create table if not exists public.expenses (
 -- llave anon pueda insertar, leer y eliminar gastos:
 alter table public.expenses disable row level security;
 ```
+
+## Logo del negocio (imagen)
+
+- En **Personalizar** (solo admin) ya no hay campo de emoji: hay **"Subir
+  imagen del logo"** (JPG, PNG o WebP, máx. 10 MB antes de comprimir). Al
+  elegirla, el navegador la comprime con canvas a un máximo de 512×512 px
+  y menos de 200 KB, muestra una vista previa, y se guarda en
+  `settings.logo_url` como data URL (base64) al pulsar **"Guardar datos
+  del negocio"**. Hay botón **"Quitar imagen"** para volver al logo por
+  defecto. El emoji (`logo_emoji`, 🥩) queda solo como respaldo cuando no
+  hay imagen subida y ya no se edita desde Personalizar.
+- La imagen se muestra en el **header del POS** (círculo de 48 px) y en el
+  **ticket** de la venta (círculo de 40 px junto al nombre del negocio).
+- Sin internet, el logo se sigue viendo: los datos del negocio (incluida
+  la imagen) se guardan también en `localStorage` de ese equipo (clave
+  `elrodeo_settings`) al cargar y al guardar. Si se guarda sin internet,
+  queda en el equipo y hay que volver a pulsar Guardar con internet para
+  que quede en la nube.
+- El icono de la **app instalada (PWA)** no cambia desde Personalizar: es
+  el archivo fijo `public/icon.svg` (hoy lleva el logo oficial de EL
+  RODEO, borrego con sombrero).
 
 ## Modo sin internet
 
@@ -161,10 +182,12 @@ instalado y se haya entrado al menos una vez con internet).
 
 ## Login y bitácora
 
-- Login con Supabase Auth (email + contraseña, `supabase.auth.signInWithPassword`).
-  Sin sesión, el POS muestra solo la pantalla de login. La sesión persiste
+- Login con Supabase Auth (correo o nombre de usuario + contraseña,
+  `supabase.auth.signInWithPassword`). Sin sesión, el POS muestra solo
+  la pantalla de login. La sesión persiste
   (supabase-js la guarda en el navegador) y se restaura al volver a abrirlo.
   Botón "Cerrar sesión" en el header. **No hay registro en la app.**
+  Ver "Entrar con nombre de usuario" en la sección "Usuarios y roles".
 - Admin principal: `Salvadordominguezcc@gmail.com`. Solo ese correo ve la
   pestaña "Bitácora".
 - Bitácora: en cada login exitoso y en cada cierre de sesión la app inserta
@@ -225,10 +248,41 @@ cajero; el admin les puede subir el rol desde la pestaña Usuarios.
     reactiva. Un usuario desactivado no puede entrar aunque tenga su
     contraseña.
   - **Eliminar:** con confirmación; borra la cuenta de Supabase Auth.
-  - No se puede modificar ni eliminar la propia cuenta ni la del admin
-    principal desde la pestaña.
+  - No se puede cambiar el rol, desactivar ni eliminar la propia
+    cuenta ni la del admin principal desde la pestaña. El nombre de
+    usuario SÍ se puede asignar o cambiar en cualquier cuenta (incluida
+    la propia y la del admin principal), porque es solo un alias para
+    entrar, no un permiso.
   - Errores en español y en claro: correo duplicado ("Ya existe un
     usuario con ese correo"), contraseña corta, sesión expirada, etc.
+
+### Entrar con nombre de usuario
+
+- Además del correo, cada cuenta puede tener un **nombre de usuario**
+  (opcional): letras, números, guion bajo (_) y punto (.), mínimo 3
+  caracteres, sin espacios. Se guarda en `user_metadata.username` de
+  Supabase Auth, en minúsculas.
+- Se asigna al crear el usuario (campo "Usuario (opcional)") o después,
+  en la lista de Usuarios: cada cuenta muestra su usuario actual (o
+  "sin usuario") y un campo para cambiarlo con el botón "Guardar
+  usuario". Dejar el campo vacío quita el usuario y el login queda solo
+  por correo. El header muestra `@usuario · correo · rol` cuando la
+  cuenta tiene usuario.
+- La pantalla de login tiene un solo campo: **"Correo o nombre de
+  usuario"**. Si lo que se escribe lleva @, entra directo con ese
+  correo. Si no lleva @, la app lo resuelve a su correo con
+  `GET /api/users?username=<usuario>` y luego entra con
+  `signInWithPassword` como siempre. La contraseña nunca viaja a esa
+  ruta.
+- La resolución es pública y limitada: devuelve **SOLO el correo**
+  asociado (un usuario por llamada), no expone contraseñas ni lista
+  usuarios, y si el usuario no existe responde el mismo error genérico
+  de login ("Correo, nombre de usuario o contraseña incorrectos"), sin
+  revelar si existe. Además tiene límite de 20 intentos por minuto por
+  IP. La búsqueda usa la llave service_role del servidor, y la
+  unicidad del usuario se verifica al crearlo y al cambiarlo: si ya
+  está en uso, el error es "Ese nombre de usuario ya está en uso.
+  Elige otro."
 
 ### Por qué hace falta la llave service_role
 
@@ -240,8 +294,10 @@ de Supabase Auth. Por eso la gestión pasa por una API route del servidor
 `Salvadordominguezcc@gmail.com` o `user_metadata.role === "admin"`) y
 rechaza con 403 a cualquiera que no lo sea. Solo entonces usa la llave
 service_role, que vive **únicamente del lado del servidor** y nunca se
-expone al cliente. Endpoints: `GET` lista, `POST` crear, `PATCH` cambiar
-rol / activar-desactivar, `DELETE` eliminar.
+expone al cliente. Endpoints: `GET` lista (admin), `GET ?username=`
+resuelve un usuario a su correo (público, limitado), `POST` crear,
+`PATCH` cambiar rol / activar-desactivar / nombre de usuario,
+`DELETE` eliminar.
 
 ### Agregar `SUPABASE_SERVICE_ROLE_KEY` en Vercel (solo el dueño)
 
