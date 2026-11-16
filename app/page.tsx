@@ -6,8 +6,23 @@ import { SEED_PRODUCTS, SEED_SETTINGS, Product } from "../lib/menu";
 type Line = { product: Product; qty: number };
 type Sale = { id: string; folio: number; total_cents: number; payment_method: string; created_at: string; items?: { product_name: string; quantity: number; subtotal_cents: number }[] };
 type Cut = { id: string; opening_cents: number; expected_cents: number; counted_cents: number; difference_cents: number; created_at: string; status: string };
+type AccessLog = { id: string; user_id: string | null; user_email: string | null; action: string; created_at: string };
+type Expense = { id: string; description: string; amount_cents: number; category: string | null; created_at: string };
+type SessionUser = { id: string; email: string };
 
-const TABS = ["Ventas", "Catálogo", "Corte de caja", "Reportes", "Personalizar"] as const;
+// Fecha local del negocio (America/Tijuana) en formato YYYY-MM-DD, para
+// agrupar los gastos (y las ventas) "de hoy" como los ve el usuario.
+function localDay(iso: string) {
+  return new Date(iso).toLocaleDateString("en-CA", { timeZone: "America/Tijuana" });
+}
+
+// Cuenta admin principal: solo este correo ve la pestaña "Bitácora".
+// Los usuarios se crean en el panel de Supabase Auth (Authentication → Users),
+// la app no tiene registro.
+const ADMIN_EMAIL = "salvadordominguezcc@gmail.com";
+
+const BASE_TABS = ["Ventas", "Catálogo", "Gastos", "Corte de caja", "Reportes", "Personalizar"] as const;
+const TABS = [...BASE_TABS, "Bitácora"] as const;
 
 export default function POS() {
   const [tab, setTab] = useState<(typeof TABS)[number]>("Ventas");
@@ -26,6 +41,22 @@ export default function POS() {
   const [contado, setContado] = useState("");
   const [nuevo, setNuevo] = useState({ name: "", price: "", unit: "pieza", description: "" });
   const [edit, setEdit] = useState<Record<string, { name: string; price: string; unit: string; description: string }>>({});
+  // Login por persona (Supabase Auth) + bitácora de accesos (solo admin).
+  const [user, setUser] = useState<SessionUser | null>(null);
+  const [authChecked, setAuthChecked] = useState(false);
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPass, setLoginPass] = useState("");
+  const [loginError, setLoginError] = useState("");
+  const [loginLoading, setLoginLoading] = useState(false);
+  const [logEntries, setLogEntries] = useState<AccessLog[]>([]);
+  const [logStatus, setLogStatus] = useState<"idle" | "loading" | "ok" | "missing" | "error">("idle");
+  // Gastos del día (salidas de caja). Sin stock ni inventario.
+  const [expenses, setExpenses] = useState<Expense[]>([]);
+  const [expenseStatus, setExpenseStatus] = useState<"idle" | "loading" | "ok" | "missing" | "error">("idle");
+  const [gasto, setGasto] = useState({ description: "", amount: "", category: "Insumos" });
+
+  const isAdmin = !!user && user.email.toLowerCase() === ADMIN_EMAIL;
+  const visibleTabs = (isAdmin ? TABS : BASE_TABS) as readonly string[];
 
   const total = ticket.reduce((s, l) => s + l.product.price_cents * l.qty, 0);
   const cambio = pay === "efectivo" && cash ? Math.max(0, Math.round(parseFloat(cash) * 100) - total) : 0;
@@ -41,10 +72,108 @@ export default function POS() {
       if (s) setSales(s.map((x: any) => ({ ...x, items: x.sale_items })));
       const { data: c } = await supabase.from("cash_cuts").select("*").order("created_at", { ascending: false }).limit(20);
       if (c) setCuts(c);
+      // Gastos: tolerante si la tabla expenses aún no existe en Supabase.
+      setExpenseStatus("loading");
+      const { data: ex, error: exErr } = await supabase.from("expenses")
+        .select("id, description, amount_cents, category, created_at")
+        .order("created_at", { ascending: false }).limit(100);
+      if (exErr) {
+        console.warn("No se pudieron leer los gastos:", exErr.message);
+        setExpenseStatus(exErr.message.includes("expenses") ? "missing" : "error");
+        setExpenses([]);
+      } else {
+        setExpenses((ex || []) as Expense[]);
+        setExpenseStatus("ok");
+      }
     }
     setLoading(false);
   }
-  useEffect(() => { load(); }, []);
+  // Registra un acceso en access_log. Si la tabla aún no existe (o el insert
+  // falla por cualquier motivo), NO bloquea el login/logout: solo avisa en
+  // consola. La tabla se crea en Supabase con el SQL de README.md.
+  async function logAccess(u: SessionUser, action: "login" | "logout") {
+    if (!supabase) return;
+    try {
+      const { error } = await supabase.from("access_log").insert({
+        user_id: u.id, user_email: u.email, action,
+      });
+      if (error) console.warn("Bitácora no registrada:", error.message);
+    } catch (e) {
+      console.warn("Bitácora no registrada:", e);
+    }
+  }
+
+  async function cargarBitacora() {
+    if (!supabase) return;
+    setLogStatus("loading");
+    const { data, error } = await supabase.from("access_log")
+      .select("id, user_id, user_email, action, created_at")
+      .order("created_at", { ascending: false }).limit(100);
+    if (error) {
+      // Tabla inexistente (PGRST205 / 42P01) u otro error de lectura.
+      console.warn("No se pudo leer la bitácora:", error.message);
+      setLogStatus(error.message.includes("access_log") ? "missing" : "error");
+      setLogEntries([]);
+    } else {
+      setLogEntries((data || []) as AccessLog[]);
+      setLogStatus("ok");
+    }
+  }
+
+  async function entrar() {
+    if (!supabase) { setLoginError("Supabase no está conectado: falta la llave anon en Vercel."); return; }
+    if (!loginEmail.trim() || !loginPass) { setLoginError("Escribe tu correo y tu contraseña."); return; }
+    setLoginLoading(true);
+    setLoginError("");
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: loginEmail.trim(), password: loginPass,
+    });
+    setLoginLoading(false);
+    if (error || !data.user?.email) {
+      setLoginError(
+        error?.message === "Invalid login credentials"
+          ? "Correo o contraseña incorrectos. Revisa tus datos e inténtalo de nuevo."
+          : error?.message === "Email not confirmed"
+            ? "Tu correo aún no está confirmado. Revisa tu bandeja de entrada."
+            : "No se pudo entrar: " + (error?.message || "inténtalo de nuevo."),
+      );
+      return;
+    }
+    const u: SessionUser = { id: data.user.id, email: data.user.email };
+    setUser(u);
+    setLoginPass("");
+    await logAccess(u, "login");
+    if (u.email.toLowerCase() === ADMIN_EMAIL) await cargarBitacora();
+  }
+
+  async function salir() {
+    if (user) await logAccess(user, "logout");
+    if (supabase) await supabase.auth.signOut();
+    setUser(null);
+    setLogEntries([]);
+    setLogStatus("idle");
+    setTab("Ventas");
+    setTicket([]);
+  }
+
+  useEffect(() => {
+    // Sesión persistente: supabase-js guarda la sesión en el navegador y
+    // la restaura al volver a abrir el POS. Restaurar sesión NO registra
+    // un login en la bitácora; solo el inicio de sesión explícito lo hace.
+    (async () => {
+      if (supabase) {
+        const { data } = await supabase.auth.getSession();
+        const s = data.session?.user;
+        if (s?.email) {
+          const u: SessionUser = { id: s.id, email: s.email };
+          setUser(u);
+          if (u.email.toLowerCase() === ADMIN_EMAIL) await cargarBitacora();
+        }
+      }
+      setAuthChecked(true);
+    })();
+  }, []);
+  useEffect(() => { if (user) load(); }, [user]);
 
   function addToTicket(p: Product, qty: number) {
     setTicket((t) => {
@@ -119,11 +248,42 @@ export default function POS() {
     } else setMsg(active ? `"${p.name}" vuelve a estar en el menú.` : `"${p.name}" quitado del menú.`);
   }
 
+  // Gastos del día: se guardan en Supabase (tabla expenses). Si la tabla
+  // aún no existe, se guardan solo en pantalla y se avisa con claridad.
+  async function agregarGasto() {
+    const amount = Math.round(parseFloat(gasto.amount || "0") * 100);
+    if (!gasto.description.trim() || !amount || amount <= 0) { setMsg("Para registrar un gasto escribe la descripción y el monto."); return; }
+    const exp: Expense = { id: crypto.randomUUID(), description: gasto.description.trim(), amount_cents: amount, category: gasto.category, created_at: new Date().toISOString() };
+    setExpenses((xs) => [exp, ...xs]);
+    setGasto({ description: "", amount: "", category: "Insumos" });
+    if (supabase) {
+      const { data, error } = await supabase.from("expenses").insert({ description: exp.description, amount_cents: amount, category: exp.category }).select("id").single();
+      if (error) setMsg("Gasto guardado en pantalla, pero Supabase respondió: " + error.message + " Crea la tabla expenses con el SQL de README.md.");
+      else { setExpenses((xs) => xs.map((x) => (x.id === exp.id ? { ...x, id: data.id } : x))); setMsg(`Gasto de ${fmt(amount)} registrado.`); }
+    } else setMsg(`Gasto de ${fmt(amount)} registrado en pantalla. Conecta Supabase para guardarlo en la nube.`);
+  }
+
+  async function eliminarGasto(e: Expense) {
+    if (!window.confirm(`¿Eliminar el gasto "${e.description}" por ${fmt(e.amount_cents)}?`)) return;
+    setExpenses((xs) => xs.filter((x) => x.id !== e.id));
+    // Solo se intenta borrar en Supabase si la tabla expenses existe
+    // (si no, el gasto solo vivía en pantalla).
+    if (supabase && expenseStatus === "ok") {
+      const { error } = await supabase.from("expenses").delete().eq("id", e.id);
+      setMsg(error ? "No se pudo eliminar en Supabase: " + error.message : "Gasto eliminado.");
+    } else setMsg("Gasto eliminado.");
+  }
+
+  const gastosHoy = useMemo(() => expenses.filter((e) => localDay(e.created_at) === localDay(new Date().toISOString())), [expenses]);
+  const totalGastosHoy = gastosHoy.reduce((s, x) => s + x.amount_cents, 0);
+
   const ventasHoy = useMemo(() => sales.filter((s) => s.created_at.slice(0, 10) === new Date().toISOString().slice(0, 10)), [sales]);
   const efectivoHoy = ventasHoy.filter((s) => s.payment_method === "efectivo").reduce((s, x) => s + x.total_cents, 0);
   const tarjetaHoy = ventasHoy.filter((s) => s.payment_method === "tarjeta").reduce((s, x) => s + x.total_cents, 0);
   const transfHoy = ventasHoy.filter((s) => s.payment_method === "transferencia").reduce((s, x) => s + x.total_cents, 0);
-  const esperado = Math.round(fondo * 100) + efectivoHoy;
+  // Efectivo esperado en caja: fondo + ventas en efectivo de hoy
+  // − gastos del día (las salidas de caja). Sin gastos queda igual que antes.
+  const esperado = Math.round(fondo * 100) + efectivoHoy - totalGastosHoy;
   const totalVentas = sales.reduce((s, x) => s + x.total_cents, 0);
 
   async function cerrarCorte() {
@@ -149,17 +309,42 @@ export default function POS() {
     } else setMsg("Datos guardados en pantalla. Conecta la llave anon para guardarlos en Supabase.");
   }
 
+  // Sin sesión no se muestra nada del POS: solo la pantalla de login.
+  if (!authChecked) {
+    return (<div className="card" style={{ maxWidth: 420, margin: "80px auto" }}><h1>🥩 EL RODEO</h1><p className="muted">Cargando…</p></div>);
+  }
+  if (!user) {
+    return (
+      <div className="card" style={{ maxWidth: 420, margin: "80px auto" }}>
+        <h1>{SEED_SETTINGS.logo_emoji} {SEED_SETTINGS.business_name}</h1>
+        <p className="muted">Punto de venta · Entra con tu correo y contraseña.</p>
+        {!supabaseConfigured && (
+          <p className="banner">⚠️ Supabase no está conectado: falta la llave anon en Vercel. Sin conexión no se puede iniciar sesión.</p>
+        )}
+        <label>Correo</label>
+        <input type="email" value={loginEmail} onChange={(e) => setLoginEmail(e.target.value)} placeholder="tu@correo.com" onKeyDown={(e) => { if (e.key === "Enter") entrar(); }} />
+        <label>Contraseña</label>
+        <input type="password" value={loginPass} onChange={(e) => setLoginPass(e.target.value)} placeholder="Tu contraseña" onKeyDown={(e) => { if (e.key === "Enter") entrar(); }} />
+        {loginError && <p style={{ color: "#b91c1c" }}>{loginError}</p>}
+        <button className="btn" style={{ width: "100%", marginTop: 12 }} disabled={loginLoading || !supabaseConfigured} onClick={entrar}>
+          {loginLoading ? "Entrando…" : "Entrar"}
+        </button>
+        <p className="muted" style={{ marginTop: 12 }}>Sin registro en la app: tu cuenta la crea el administrador en Supabase Auth.</p>
+      </div>
+    );
+  }
+
   return (
     <div style={{ ["--accent" as any]: settings.main_color || "#c2410c" }}>
       <header>
         <div><h1>{settings.logo_emoji} {settings.business_name}</h1><p>{settings.slogan} · Punto de venta</p></div>
-        <div style={{ textAlign: "right" }}><p>{supabaseConfigured ? "● Conectado a Supabase" : "○ Sin conexión a Supabase"}</p><p>{loading ? "Cargando…" : `${products.length} productos · ${sales.length} ventas`}</p></div>
+        <div style={{ textAlign: "right" }}><p>{supabaseConfigured ? "● Conectado a Supabase" : "○ Sin conexión a Supabase"}</p><p>{loading ? "Cargando…" : `${products.length} productos · ${sales.length} ventas`}</p><p className="muted">{user?.email}</p><button className="btn sec" onClick={salir}>Cerrar sesión</button></div>
       </header>
       {!supabaseConfigured && (
         <div className="banner">⚠️ Falta la llave anon de Supabase: el menú se muestra, pero las ventas no se guardan en la nube todavía. En Vercel agrega la variable <b>NEXT_PUBLIC_SUPABASE_ANON_KEY</b> con la llave “anon public” de Supabase (Settings → API) y vuelve a desplegar.</div>
       )}
-      {supabaseConfigured && <div className="banner ok">✓ Conectado a Supabase: las ventas y los cortes se guardan en la nube.</div>}
-      <nav>{TABS.map((t) => (<button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>{t}</button>))}</nav>
+      {supabaseConfigured && <div className="banner ok">✓ Conectado a Supabase: las ventas, los gastos y los cortes se guardan en la nube.</div>}
+      <nav>{visibleTabs.map((t) => (<button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t as any)}>{t}</button>))}</nav>
       <main>
         {msg && <p className="card" style={{ background: "#eff6ff" }}>{msg} <button className="btn sec" onClick={() => setMsg("")}>✕</button></p>}
 
@@ -257,6 +442,42 @@ export default function POS() {
           </div>
         )}
 
+        {tab === "Gastos" && (
+          <div>
+            <h2>Gastos del día</h2>
+            <p className="muted">Salidas de caja de hoy. Se descuentan del efectivo esperado en el corte de caja.</p>
+            <div className="card" style={{ marginBottom: 16 }}>
+              <h2>Registrar gasto</h2>
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                <input style={{ flex: 2, minWidth: 160 }} placeholder="Descripción, ej. Gas para el comal" value={gasto.description} onChange={(e) => setGasto({ ...gasto, description: e.target.value })} onKeyDown={(e) => { if (e.key === "Enter") agregarGasto(); }} />
+                <input style={{ maxWidth: 130 }} type="number" placeholder="Monto $" value={gasto.amount} onChange={(e) => setGasto({ ...gasto, amount: e.target.value })} onKeyDown={(e) => { if (e.key === "Enter") agregarGasto(); }} />
+                <select style={{ maxWidth: 160 }} value={gasto.category} onChange={(e) => setGasto({ ...gasto, category: e.target.value })}>
+                  <option value="Insumos">Insumos</option><option value="Servicios">Servicios</option><option value="Transporte">Transporte</option><option value="Nómina">Nómina</option><option value="Otros">Otros</option>
+                </select>
+                <button className="btn" onClick={agregarGasto}>Agregar gasto</button>
+              </div>
+            </div>
+            <div className="card" style={{ marginBottom: 16 }}>
+              <div className="row"><span>Total de gastos hoy</span><span className="big">{fmt(totalGastosHoy)}</span></div>
+              <div className="muted">{gastosHoy.length} {gastosHoy.length === 1 ? "gasto" : "gastos"} hoy</div>
+            </div>
+            {expenseStatus === "missing" && (
+              <p className="card">Los gastos se guardan solo en pantalla por ahora: la tabla <b>expenses</b> aún no existe en Supabase. Créala con el SQL de README.md para que se guarden en la nube.</p>
+            )}
+            {expenseStatus === "error" && (
+              <p className="card">No se pudieron leer los gastos de Supabase. Revisa la tabla expenses.</p>
+            )}
+            {expenseStatus === "loading" && <p className="muted">Cargando gastos…</p>}
+            {gastosHoy.map((e) => (
+              <div key={e.id} className="row">
+                <span>{new Date(e.created_at).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit" })} · {e.description} · {e.category || "Otros"}</span>
+                <span><b>{fmt(e.amount_cents)}</b> <button className="btn sec" onClick={() => eliminarGasto(e)}>Eliminar</button></span>
+              </div>
+            ))}
+            {!gastosHoy.length && expenseStatus !== "loading" && <p className="muted">Sin gastos registrados hoy.</p>}
+          </div>
+        )}
+
         {tab === "Corte de caja" && (
           <div>
             <h2>Corte de caja</h2>
@@ -270,9 +491,11 @@ export default function POS() {
               <div className="card">
                 <div className="row"><span>Fondo</span><b>{fmt(Math.round(fondo * 100))}</b></div>
                 <div className="row"><span>Ventas en efectivo hoy</span><b>{fmt(efectivoHoy)}</b></div>
+                <div className="row"><span>Gastos del día (salidas de caja)</span><b>− {fmt(totalGastosHoy)}</b></div>
                 <div className="row"><span>Ventas con tarjeta hoy</span><b>{fmt(tarjetaHoy)}</b></div>
                 <div className="row"><span>Ventas por transferencia hoy</span><b>{fmt(transfHoy)}</b></div>
                 <div className="row"><span>Efectivo esperado</span><b>{fmt(esperado)}</b></div>
+                <p className="muted">Efectivo esperado = fondo + ventas en efectivo − gastos del día.</p>
                 <label>Efectivo contado ($)</label>
                 <input type="number" value={contado} onChange={(e) => setContado(e.target.value)} placeholder="0.00" />
                 <p>Sobrante / faltante: <b>{contado ? fmt(Math.round(parseFloat(contado) * 100) - esperado) : "—"}</b></p>
@@ -328,6 +551,28 @@ export default function POS() {
             <label>Fondo inicial de caja (centavos)</label>
             <input type="number" value={settings.initial_cash_cents ?? 50000} onChange={(e) => setSettings({ ...settings, initial_cash_cents: parseInt(e.target.value) || 0 })} />
             <button className="btn" onClick={guardarSettings}>Guardar datos del negocio</button>
+          </div>
+        )}
+
+        {tab === "Bitácora" && isAdmin && (
+          <div>
+            <h2>Bitácora de accesos</h2>
+            <p className="muted">Últimos 100 accesos. Solo la ve la cuenta admin principal.</p>
+            <button className="btn sec" onClick={cargarBitacora}>Actualizar</button>
+            {logStatus === "missing" && (
+              <p className="card" style={{ marginTop: 12 }}>Bitácora aún no activada en Supabase. Crea la tabla <b>access_log</b> con el SQL de README.md y recarga.</p>
+            )}
+            {logStatus === "error" && (
+              <p className="card" style={{ marginTop: 12 }}>No se pudo leer la bitácora. Revisa la tabla access_log en Supabase.</p>
+            )}
+            {logStatus === "loading" && <p className="muted">Cargando bitácora…</p>}
+            {logStatus === "ok" && !logEntries.length && <p className="muted">Sin accesos registrados todavía.</p>}
+            {logEntries.map((l) => (
+              <div key={l.id} className="row">
+                <span>{new Date(l.created_at).toLocaleString("es-MX")} · {l.user_email || "—"}</span>
+                <b>{l.action === "login" ? "Entrada" : l.action === "logout" ? "Salida" : l.action}</b>
+              </div>
+            ))}
           </div>
         )}
       </main>
