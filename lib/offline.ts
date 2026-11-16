@@ -28,6 +28,10 @@ export type OfflineItem =
       payment_method: string;
       customer_name: string | null;
       created_at: string;
+      // Quién vendió: se guarda en Supabase (sales.sold_by_email /
+      // sold_by_name) al sincronizar, igual que en una venta online.
+      sold_by_email: string | null;
+      sold_by_name: string | null;
       items: OfflineSaleItem[];
     }
   | {

@@ -9,7 +9,7 @@ POS standalone de EL RODEO para usar fuera de Muse con link público.
 - Login por persona (Supabase Auth, email + contraseña), bitácora de accesos (solo admin) y gestión de usuarios con roles admin / cajero (solo admin). Ver "Login y bitácora" y "Usuarios y roles" abajo.
 - Modo sin internet: vender y registrar gastos sin señal; todo se guarda en el equipo y se sincroniza solo al volver la conexión. Ver "Modo sin internet" abajo.
 - Corte de caja: apertura con fondo, resumen por método de pago, esperado vs. contado, sobrante/faltante, historial.
-- Reportes: totales, ventas de hoy, ventas por producto.
+- Reportes: totales, ventas de hoy, ventas por producto y ventas por persona (quién vendió cada venta: total y número de ventas de cada usuario o correo, hoy y en total). Cada venta guarda `sold_by_email` y `sold_by_name` en la tabla `sales`; si esas columnas aún no existen, la venta se guarda igual sin el vendedor.
 - Personalizar: nombre EL RODEO, eslogan, imagen de logo (se sube en la pestaña), color, tema, datos del negocio (dirección, teléfono, correo, RFC, horario, mensaje de ticket, fondo inicial).
 
 ## Base de datos

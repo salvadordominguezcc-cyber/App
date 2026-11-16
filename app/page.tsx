@@ -11,7 +11,7 @@ import {
 } from "../lib/offline";
 
 type Line = { product: Product; qty: number };
-type Sale = { id: string; folio: number | null; total_cents: number; payment_method: string; created_at: string; pending?: boolean; items?: { product_name: string; quantity: number; subtotal_cents: number }[] };
+type Sale = { id: string; folio: number | null; total_cents: number; payment_method: string; created_at: string; pending?: boolean; sold_by_email?: string | null; sold_by_name?: string | null; items?: { product_name: string; quantity: number; subtotal_cents: number }[] };
 type Cut = { id: string; opening_cents: number; expected_cents: number; counted_cents: number; difference_cents: number; created_at: string; status: string; pending?: boolean };
 type AccessLog = { id: string; user_id: string | null; user_email: string | null; action: string; created_at: string };
 type Expense = { id: string; description: string; amount_cents: number; category: string | null; created_at: string; pending?: boolean };
@@ -49,6 +49,28 @@ function roleOf(user: { user_metadata?: any } | null, email: string): "admin" | 
 function usernameOf(user: { user_metadata?: any } | null): string | null {
   const u = String(user?.user_metadata?.username || "").trim().toLowerCase();
   return u || null;
+}
+
+// ¿El error es porque la tabla sales aún no tiene las columnas sold_by_*?
+// En ese caso la venta se reintenta sin esas columnas y NO falla.
+function isMissingSellerColumn(err: any): boolean {
+  const m = String(err?.message || err || "").toLowerCase();
+  return err?.code === "PGRST204" || (m.includes("sold_by") && (m.includes("column") || m.includes("schema cache")));
+}
+
+// Agrupa ventas por persona (nombre de usuario o correo): total y conteo,
+// ordenadas por total vendido. Las ventas viejas sin registro quedan como
+// "Sin registro".
+function agruparVentasPorPersona(list: Sale[]): Array<[string, { total_cents: number; count: number }]> {
+  const map = new Map<string, { total_cents: number; count: number }>();
+  for (const s of list) {
+    const key = s.sold_by_name || s.sold_by_email || "Sin registro";
+    const cur = map.get(key) || { total_cents: 0, count: 0 };
+    cur.total_cents += s.total_cents;
+    cur.count += 1;
+    map.set(key, cur);
+  }
+  return [...map.entries()].sort((a, b) => b[1].total_cents - a[1].total_cents);
 }
 
 // Cajero: Ventas, Catálogo, Gastos, Corte de caja y Reportes.
@@ -113,6 +135,12 @@ export default function POS() {
   const [logoMsg, setLogoMsg] = useState("");
 
   const isAdmin = !!user && user.role === "admin";
+  // Quién vendió: se guarda en cada venta (sold_by_email / sold_by_name
+  // en Supabase). Nombre = @usuario si lo tiene, si no el correo.
+  function soldBy(): { email: string | null; name: string | null } {
+    if (!user) return { email: null, name: null };
+    return { email: user.email, name: user.username ? `@${user.username}` : user.email };
+  }
   const visibleTabs = (isAdmin ? ADMIN_TABS : BASE_TABS) as readonly string[];
 
   const total = ticket.reduce((s, l) => s + l.product.price_cents * l.qty, 0);
@@ -187,6 +215,7 @@ async function load() {
       .map((x) => ({
         id: x.tempId, folio: null, total_cents: x.total_cents, payment_method: x.payment_method,
         created_at: x.created_at, pending: true,
+        sold_by_email: x.sold_by_email ?? null, sold_by_name: x.sold_by_name ?? null,
         items: x.items.map((i) => ({ product_name: i.product_name, quantity: i.quantity, subtotal_cents: i.subtotal_cents })),
       }));
     const pendingExpenses: Expense[] = q
@@ -228,12 +257,23 @@ async function load() {
         if (item.kind === "sale") {
           const { data: maxRow } = await supabase.from("sales").select("folio").order("folio", { ascending: false }).limit(1).maybeSingle();
           const folio = (maxRow?.folio || 0) + 1;
-          const { data: inserted, error } = await supabase.from("sales").insert({
+          // Quién vendió: viene en la cola offline. Si la tabla sales aún
+          // no tiene las columnas sold_by_*, se reintenta sin ellas y la
+          // venta igual se guarda (sin el vendedor).
+          const baseSale = {
             folio, total_cents: item.total_cents, payment_method: item.payment_method,
             customer_name: item.customer_name, notes: null, status: "completada",
+          };
+          let ins = await supabase.from("sales").insert({
+            ...baseSale, sold_by_email: item.sold_by_email ?? null, sold_by_name: item.sold_by_name ?? null,
           }).select("id").single();
-          if (error) throw error;
-          const saleId = inserted.id;
+          let sellerSaved = true;
+          if (ins.error && isMissingSellerColumn(ins.error)) {
+            sellerSaved = false;
+            ins = await supabase.from("sales").insert(baseSale).select("id").single();
+          }
+          if (ins.error) throw ins.error;
+          const saleId = ins.data.id;
           const { error: itemsErr } = await supabase.from("sale_items").insert(item.items.map((i) => ({
             sale_id: saleId, product_id: i.product_id, product_name: i.product_name,
             quantity: i.quantity, price_cents: i.price_cents, subtotal_cents: i.subtotal_cents,
@@ -243,7 +283,7 @@ async function load() {
             await supabase.from("sales").delete().eq("id", saleId);
             throw itemsErr;
           }
-          setSales((s) => s.map((y) => (y.id === item.tempId ? { ...y, id: saleId, folio, pending: false } : y)));
+          setSales((s) => s.map((y) => (y.id === item.tempId ? { ...y, id: saleId, folio, pending: false, sold_by_email: sellerSaved ? item.sold_by_email ?? null : null, sold_by_name: sellerSaved ? item.sold_by_name ?? null : null } : y)));
         } else if (item.kind === "expense") {
           const { data, error } = await supabase.from("expenses").insert({
             description: item.description, amount_cents: item.amount_cents, category: item.category,
@@ -582,29 +622,42 @@ async function load() {
     const tempId = crypto.randomUUID();
     const createdAt = new Date().toISOString();
     const itemsForState = itemsPayload.map((i) => ({ product_name: i.product_name, quantity: i.quantity, subtotal_cents: i.subtotal_cents }));
+    // Quién vendió: correo de la sesión y @usuario si lo tiene.
+    const seller = soldBy();
     // Sin internet: la venta va a la cola offline con folio pendiente y se
     // muestra marcada como tal. Se sincroniza sola al volver la señal.
     if (supabase && (!online || (typeof navigator !== "undefined" && navigator.onLine === false))) {
-      const sale: Sale = { id: tempId, folio: null, total_cents: total, payment_method: pay, created_at: createdAt, pending: true, items: itemsForState };
+      const sale: Sale = { id: tempId, folio: null, total_cents: total, payment_method: pay, created_at: createdAt, pending: true, sold_by_email: seller.email, sold_by_name: seller.name, items: itemsForState };
       setSales((s) => [sale, ...s]);
-      setQueue(enqueueOffline({ kind: "sale", tempId, total_cents: total, payment_method: pay, customer_name: customer || null, created_at: createdAt, items: itemsPayload }));
+      setQueue(enqueueOffline({ kind: "sale", tempId, total_cents: total, payment_method: pay, customer_name: customer || null, created_at: createdAt, sold_by_email: seller.email, sold_by_name: seller.name, items: itemsPayload }));
       setMsg(`Venta por ${fmt(total)} guardada sin internet: queda pendiente en este equipo y se sincroniza sola al volver la señal.`);
       setTicket([]); setCash(""); setCustomer("");
       return;
     }
-    const sale: Sale = { id: tempId, folio, total_cents: total, payment_method: pay, created_at: createdAt, items: itemsForState };
+    const sale: Sale = { id: tempId, folio, total_cents: total, payment_method: pay, created_at: createdAt, sold_by_email: seller.email, sold_by_name: seller.name, items: itemsForState };
     setSales((s) => [sale, ...s]);
     if (supabase) {
       // Nunca se envía el id local como uuid: Supabase genera el uuid de la venta.
-      const { data: inserted, error } = await supabase.from("sales").insert({
+      // Si la tabla sales aún no tiene las columnas sold_by_*, se reintenta
+      // sin ellas y la venta igual se guarda (sin el vendedor).
+      const baseSale = {
         folio, total_cents: total, payment_method: pay,
         customer_name: customer || null, notes: null, status: "completada",
+      };
+      let ins = await supabase.from("sales").insert({
+        ...baseSale, sold_by_email: seller.email, sold_by_name: seller.name,
       }).select("id").single();
+      let sellerSaved = true;
+      if (ins.error && isMissingSellerColumn(ins.error)) {
+        sellerSaved = false;
+        ins = await supabase.from("sales").insert(baseSale).select("id").single();
+      }
+      const { data: inserted, error } = ins;
       if (error) {
         if (isNetworkError(error)) {
           // Se cayó la red a mitad del cobro: a la cola, sin folio aún.
           setSales((s) => s.map((y) => (y.id === tempId ? { ...y, folio: null, pending: true } : y)));
-          setQueue(enqueueOffline({ kind: "sale", tempId, total_cents: total, payment_method: pay, customer_name: customer || null, created_at: createdAt, items: itemsPayload }));
+          setQueue(enqueueOffline({ kind: "sale", tempId, total_cents: total, payment_method: pay, customer_name: customer || null, created_at: createdAt, sold_by_email: seller.email, sold_by_name: seller.name, items: itemsPayload }));
           setMsg(`Venta por ${fmt(total)} guardada sin internet: queda pendiente en este equipo y se sincroniza sola al volver la señal.`);
         } else {
           setMsg("Venta guardada en pantalla, pero Supabase respondió: " + error.message);
@@ -613,7 +666,7 @@ async function load() {
         const saleId = inserted.id; // uuid real de Supabase
         const items = itemsPayload.map((i) => ({ sale_id: saleId, ...i }));
         await supabase.from("sale_items").insert(items);
-        setSales((s) => s.map((y) => (y.id === tempId ? { ...y, id: saleId } : y)));
+        setSales((s) => s.map((y) => (y.id === tempId ? { ...y, id: saleId, sold_by_email: sellerSaved ? seller.email : null, sold_by_name: sellerSaved ? seller.name : null } : y)));
         setMsg(`Venta #${folio} por ${fmt(total)} guardada en Supabase.`);
       }
     } else {
@@ -717,6 +770,11 @@ async function load() {
   // − gastos del día (las salidas de caja). Sin gastos queda igual que antes.
   const esperado = Math.round(fondo * 100) + efectivoHoy - totalGastosHoy;
   const totalVentas = sales.reduce((s, x) => s + x.total_cents, 0);
+  // Ventas por persona: quién vendió cada venta (nombre de usuario o
+  // correo). Hoy y en todo el historial. El corte sigue sumando todas las
+  // ventas del día sin importar quién vendió.
+  const ventasPorPersonaHoy = useMemo(() => agruparVentasPorPersona(ventasHoy), [ventasHoy]);
+  const ventasPorPersonaTotal = useMemo(() => agruparVentasPorPersona(sales), [sales]);
   // Cuánto de lo de hoy aún no está sincronizado (ventas/gastos offline).
   const pendientesHoy = useMemo(() => ({
     ventasEfectivo: ventasHoy.filter((s) => s.pending && s.payment_method === "efectivo").reduce((s, x) => s + x.total_cents, 0),
@@ -918,7 +976,7 @@ async function load() {
               </div>
               <h2 style={{ marginTop: 20 }}>Ventas recientes</h2>
               {sales.slice(0, 10).map((s) => (
-                <div key={s.id} className="row"><span>{s.folio ? `#${s.folio}` : "Pendiente"} · {s.payment_method} · {new Date(s.created_at).toLocaleString("es-MX")}{s.pending ? " · ⏳ pendiente de sincronizar" : ""}</span><b>{fmt(s.total_cents)}</b></div>
+                <div key={s.id} className="row"><span>{s.folio ? `#${s.folio}` : "Pendiente"} · {s.payment_method} · {new Date(s.created_at).toLocaleString("es-MX")}{s.sold_by_name || s.sold_by_email ? ` · ${s.sold_by_name || s.sold_by_email}` : ""}{s.pending ? " · ⏳ pendiente de sincronizar" : ""}</span><b>{fmt(s.total_cents)}</b></div>
               ))}
               {!sales.length && <p className="muted">Aún no hay ventas registradas.</p>}
             </div>
@@ -1082,6 +1140,16 @@ async function load() {
               const imp = sales.flatMap((s) => s.items || []).filter((i) => i.product_name === p.name).reduce((s, i) => s + Number(i.subtotal_cents), 0);
               return (<div key={p.id} className="row"><span>{p.name}</span><b>{qty} · {fmt(imp)}</b></div>);
             })}
+            <h2 style={{ marginTop: 20 }}>Ventas por persona</h2>
+            <p className="muted">Quién vendió cada venta (nombre de usuario o correo). Las ventas viejas, de antes de este cambio, aparecen como “Sin registro”.</p>
+            <h3>Hoy</h3>
+            {ventasPorPersonaHoy.length ? ventasPorPersonaHoy.map(([nombre, v]) => (
+              <div key={nombre} className="row"><span>{nombre}</span><b>{v.count} {v.count === 1 ? "venta" : "ventas"} · {fmt(v.total_cents)}</b></div>
+            )) : <p className="muted">Sin ventas hoy todavía.</p>}
+            <h3>Total</h3>
+            {ventasPorPersonaTotal.length ? ventasPorPersonaTotal.map(([nombre, v]) => (
+              <div key={nombre} className="row"><span>{nombre}</span><b>{v.count} {v.count === 1 ? "venta" : "ventas"} · {fmt(v.total_cents)}</b></div>
+            )) : <p className="muted">Sin ventas registradas todavía.</p>}
           </div>
         )}
 
