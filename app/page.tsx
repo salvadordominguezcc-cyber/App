@@ -102,6 +102,11 @@ export default function POS() {
   const [loginPass, setLoginPass] = useState("");
   const [loginError, setLoginError] = useState("");
   const [loginLoading, setLoginLoading] = useState(false);
+  const [showRecovery, setShowRecovery] = useState(false);
+  const [recoveryEmail, setRecoveryEmail] = useState("");
+  const [recoveryMsg, setRecoveryMsg] = useState("");
+  const [recoveryError, setRecoveryError] = useState("");
+  const [recoveryLoading, setRecoveryLoading] = useState(false);
   const [logEntries, setLogEntries] = useState<AccessLog[]>([]);
   const [logStatus, setLogStatus] = useState<"idle" | "loading" | "ok" | "missing" | "error">("idle");
   // Gestión de usuarios (solo admin, vía /api/users con service_role).
@@ -537,6 +542,32 @@ async function load() {
     if (u.role === "admin") await cargarBitacora();
   }
 
+  // Recuperación de contraseña por correo (antes de entrar): Supabase
+  // manda un enlace a /reset-password. El mensaje de éxito es genérico
+  // a propósito: no revela si el correo tiene cuenta. Los usuarios que
+  // entran solo con nombre de usuario (correo interno @elrodeo.local)
+  // no reciben correo: ellos piden su nueva contraseña al admin.
+  async function pedirRecuperacion() {
+    if (!supabase) { setRecoveryError("Supabase no está conectado: falta la llave anon en Vercel."); return; }
+    const email = recoveryEmail.trim().toLowerCase();
+    if (!email.includes("@") || email.includes(" ") || email.length < 5) {
+      setRecoveryError("Escribe un correo válido, por ejemplo tu@correo.com.");
+      return;
+    }
+    setRecoveryLoading(true);
+    setRecoveryError("");
+    setRecoveryMsg("");
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: "https://el-rodeo-pos.vercel.app/reset-password",
+    });
+    setRecoveryLoading(false);
+    if (error) {
+      setRecoveryError("No se pudo enviar el enlace: " + error.message);
+      return;
+    }
+    setRecoveryMsg("Si ese correo tiene cuenta, te enviamos un enlace para restablecer tu contraseña. Revisa tu bandeja de entrada (y el spam).");
+  }
+
   async function salir() {
     if (user) await logAccess(user, "logout");
     if (supabase) await supabase.auth.signOut();
@@ -947,6 +978,25 @@ async function load() {
         <button className="btn" style={{ width: "100%", marginTop: 12 }} disabled={loginLoading || !supabaseConfigured} onClick={entrar}>
           {loginLoading ? "Entrando…" : "Entrar"}
         </button>
+        {!showRecovery ? (
+          <p style={{ marginTop: 12, textAlign: "center" }}>
+            <button type="button" style={{ background: "none", border: "none", textDecoration: "underline", cursor: "pointer", color: "inherit", fontSize: "inherit", padding: 0 }} onClick={() => { setShowRecovery(true); setRecoveryMsg(""); setRecoveryError(""); setRecoveryEmail(loginEmail.includes("@") ? loginEmail.trim() : ""); }}>¿Olvidaste tu contraseña?</button>
+          </p>
+        ) : (
+          <div style={{ marginTop: 12, borderTop: "1px solid #eee", paddingTop: 12 }}>
+            <label>Correo para recuperar tu contraseña</label>
+            <input type="email" value={recoveryEmail} onChange={(e) => setRecoveryEmail(e.target.value)} placeholder="tu@correo.com" onKeyDown={(e) => { if (e.key === "Enter") pedirRecuperacion(); }} />
+            {recoveryError && <p style={{ color: "#b91c1c" }}>{recoveryError}</p>}
+            {recoveryMsg && <p style={{ color: "#166534" }}>{recoveryMsg}</p>}
+            <button className="btn" style={{ width: "100%", marginTop: 8 }} disabled={recoveryLoading || !supabaseConfigured} onClick={pedirRecuperacion}>
+              {recoveryLoading ? "Enviando…" : "Enviar enlace de recuperación"}
+            </button>
+            <p className="muted" style={{ marginTop: 8 }}>Si entras solo con nombre de usuario (sin correo real), el enlace no te llega a ningún correo: pídele tu nueva contraseña al admin desde la pestaña Usuarios.</p>
+            <p style={{ textAlign: "center" }}>
+              <button type="button" style={{ background: "none", border: "none", textDecoration: "underline", cursor: "pointer", color: "inherit", fontSize: "inherit", padding: 0 }} onClick={() => setShowRecovery(false)}>Volver a entrar</button>
+            </p>
+          </div>
+        )}
         <p className="muted" style={{ marginTop: 12 }}>Sin registro en la app: tu cuenta la crea el administrador desde la pestaña Usuarios.</p>
       </div>
     );

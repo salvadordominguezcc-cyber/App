@@ -309,6 +309,28 @@ cajero; el admin les puede subir el rol desde la pestaña Usuarios.
   está en uso, el error es "Ese nombre de usuario ya está en uso.
   Elige otro."
 
+### Recuperar contraseña por correo
+
+- En la pantalla de login, debajo de "Entrar", el enlace
+  **"¿Olvidaste tu contraseña?"** abre un formulario donde se escribe
+  el correo y se pulsa "Enviar enlace de recuperación". Usa
+  `resetPasswordForEmail` con redirección a
+  `https://el-rodeo-pos.vercel.app/reset-password` (esa URL debe estar
+  agregada en Supabase Auth → URL Configuration → Redirect URLs).
+- El mensaje de éxito es genérico a propósito ("Si ese correo tiene
+  cuenta, te enviamos un enlace…") y no revela si el correo existe.
+- La página **`/reset-password`** es pública y solo sirve con un
+  enlace válido: intercambia el `?code=` de la URL (o lee la sesión
+  del enlace implícito) y muestra el formulario de contraseña nueva
+  (mín. 6 caracteres, con confirmación). Al guardar usa
+  `updateUser({ password })`, cierra la sesión de recuperación y
+  redirige al login. Si el enlace expiró o es inválido, muestra el
+  error y un enlace para pedir otro.
+- Los usuarios que entran solo con nombre de usuario (correo interno
+  `@elrodeo.local`) no reciben correo: el formulario lo aclara y les
+  dice que pidan su nueva contraseña al admin (restablecer desde la
+  pestaña Usuarios).
+
 ### Por qué hace falta la llave service_role
 
 La llave anon del navegador **no puede** crear ni administrar usuarios
