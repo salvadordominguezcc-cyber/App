@@ -4,6 +4,7 @@ POS standalone de EL RODEO para usar fuera de Muse con link público.
 
 ## Qué incluye
 - Ventas: rejilla de productos, atajos de kilo ¼ / ½ / 1 kg, ticket, efectivo (con cambio) / tarjeta / transferencia, folio.
+- Imprimir ticket: después de cobrar aparece el comprobante (logo, negocio, dirección, horario, folio o "Pendiente" si es offline, fecha y hora, quién vendió, renglones, total, pago y cambio si fue en efectivo, mensaje del ticket) con el botón "🖨️ Imprimir ticket" (window.print, CSS de impresión: solo sale el comprobante en formato angosto de 80 mm, en celular abre el diálogo de imprimir/compartir del sistema). Cada venta de "Ventas recientes" tiene su botón "🖨️ Imprimir" para reimprimirlo; si la venta no trae renglones guardados, se avisa en lugar de imprimir un ticket vacío. Imprimir o reimprimir no duplica la venta.
 - Catálogo: agregar, editar y quitar productos del menú. Sin stock: las ventas ya NO descuentan stock ni crean movimientos de inventario.
 - Gastos: registrar gastos del día (descripción, monto, categoría) y ver el total del día. Se descuentan del efectivo esperado en el corte de caja. Ver "Gastos" abajo.
 - Login por persona (Supabase Auth, email + contraseña), bitácora de accesos (solo admin) y gestión de usuarios con roles admin / cajero (solo admin). Ver "Login y bitácora" y "Usuarios y roles" abajo.

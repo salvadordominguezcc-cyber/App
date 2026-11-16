@@ -89,6 +89,10 @@ export default function POS() {
   const [cash, setCash] = useState("");
   const [customer, setCustomer] = useState("");
   const [msg, setMsg] = useState("");
+  // Comprobante a imprimir: la venta que se acaba de cobrar (o la que se
+  // reimprime desde el historial) + el efectivo recibido, si se conoce.
+  // Imprimir no vuelve a guardar nada: la venta ya quedó registrada.
+  const [printSale, setPrintSale] = useState<{ sale: Sale; cashCents: number | null } | null>(null);
   const [loading, setLoading] = useState(true);
   const [cajaAbierta, setCajaAbierta] = useState(false);
   const [fondo, setFondo] = useState(500);
@@ -658,8 +662,16 @@ async function load() {
   }, [isAdmin, tab]);
   // La lista de usuarios se carga al abrir la pestaña Usuarios (solo admin).
   useEffect(() => { if (tab === "Usuarios" && isAdmin) cargarUsuarios(); }, [tab, isAdmin]);
+  // Al terminar de imprimir (o cancelar el diálogo de imprimir), se cierra
+  // el comprobante y el POS queda listo para la siguiente venta.
+  useEffect(() => {
+    const cerrar = () => setPrintSale(null);
+    window.addEventListener("afterprint", cerrar);
+    return () => window.removeEventListener("afterprint", cerrar);
+  }, []);
 
   function addToTicket(p: Product, qty: number) {
+    setPrintSale(null); // Nueva venta: se cierra el comprobante anterior.
     setTicket((t) => {
       const i = t.findIndex((l) => l.product.id === p.id);
       if (i >= 0) { const n = [...t]; n[i] = { ...n[i], qty: n[i].qty + qty }; return n; }
@@ -684,6 +696,9 @@ async function load() {
     const itemsForState = itemsPayload.map((i) => ({ product_name: i.product_name, quantity: i.quantity, subtotal_cents: i.subtotal_cents }));
     // Quién vendió: correo de la sesión y @usuario si lo tiene.
     const seller = soldBy();
+    // Efectivo recibido (para el ticket). Se captura aquí porque al final
+    // del cobro se vacían el ticket y el campo de efectivo.
+    const cashCents = pay === "efectivo" && cash ? Math.round(parseFloat(cash) * 100) : null;
     // Sin internet: la venta va a la cola offline con folio pendiente y se
     // muestra marcada como tal. Se sincroniza sola al volver la señal.
     if (supabase && (!online || (typeof navigator !== "undefined" && navigator.onLine === false))) {
@@ -692,9 +707,13 @@ async function load() {
       setQueue(enqueueOffline({ kind: "sale", tempId, total_cents: total, payment_method: pay, customer_name: customer || null, created_at: createdAt, sold_by_email: seller.email, sold_by_name: seller.name, items: itemsPayload }));
       setMsg(`Venta por ${fmt(total)} guardada sin internet: queda pendiente en este equipo y se sincroniza sola al volver la señal.`);
       setTicket([]); setCash(""); setCustomer("");
+      setPrintSale({ sale, cashCents });
       return;
     }
     const sale: Sale = { id: tempId, folio, total_cents: total, payment_method: pay, created_at: createdAt, sold_by_email: seller.email, sold_by_name: seller.name, items: itemsForState };
+    // Comprobante que se muestra al final del cobro. Si la red se cae a
+    // mitad del cobro, la venta queda pendiente y sin folio.
+    let printData: Sale = sale;
     setSales((s) => [sale, ...s]);
     if (supabase) {
       // Nunca se envía el id local como uuid: Supabase genera el uuid de la venta.
@@ -719,6 +738,7 @@ async function load() {
           setSales((s) => s.map((y) => (y.id === tempId ? { ...y, folio: null, pending: true } : y)));
           setQueue(enqueueOffline({ kind: "sale", tempId, total_cents: total, payment_method: pay, customer_name: customer || null, created_at: createdAt, sold_by_email: seller.email, sold_by_name: seller.name, items: itemsPayload }));
           setMsg(`Venta por ${fmt(total)} guardada sin internet: queda pendiente en este equipo y se sincroniza sola al volver la señal.`);
+          printData = { ...sale, folio: null, pending: true };
         } else {
           setMsg("Venta guardada en pantalla, pero Supabase respondió: " + error.message);
         }
@@ -733,6 +753,24 @@ async function load() {
       setMsg(`Venta #${folio} por ${fmt(total)} registrada en pantalla. Conecta la llave anon de Supabase para guardarla en la nube.`);
     }
     setTicket([]); setCash(""); setCustomer("");
+    setPrintSale({ sale: printData, cashCents });
+  }
+
+  // Método de pago en español para el ticket.
+  function metodoPago(m: string) {
+    return m === "tarjeta" ? "Tarjeta" : m === "transferencia" ? "Transferencia" : "Efectivo";
+  }
+
+  // Reimprimir el ticket de una venta del historial. No vuelve a guardar
+  // nada: solo muestra el comprobante con los renglones ya guardados. El
+  // efectivo recibido no se guarda en la venta, así que en la reimpresión
+  // no se muestran recibido ni cambio.
+  function reimprimir(s: Sale) {
+    if (!s.items || !s.items.length) {
+      setMsg("Esta venta no tiene renglones guardados, no se puede imprimir su ticket.");
+      return;
+    }
+    setPrintSale({ sale: s, cashCents: null });
   }
 
   // Catálogo: agregar, editar y quitar productos del menú. Sin stock.
@@ -1033,6 +1071,39 @@ async function load() {
       <main>
         {msg && <p className="card" style={{ background: "#eff6ff" }}>{msg} <button className="btn sec" onClick={() => setMsg("")}>✕</button></p>}
 
+        {printSale && (
+          <div id="ticket-print" className="ticket-print">
+            <div style={{ textAlign: "center" }}>
+              <img src={settings.logo_url || "/icon.svg"} alt="Logo de EL RODEO" style={{ width: 56, height: 56, objectFit: "cover", borderRadius: "50%", background: "#fff" }} />
+              <div style={{ fontSize: 20, fontWeight: 800 }}>{settings.business_name}</div>
+              {settings.slogan && <div>{settings.slogan}</div>}
+              {settings.address && <div>{settings.address}</div>}
+              {settings.hours && <div>{settings.hours}</div>}
+            </div>
+            <hr />
+            <div>Folio: <b>{printSale.sale.folio ? `#${printSale.sale.folio}` : "Pendiente"}</b></div>
+            <div>Fecha: {new Date(printSale.sale.created_at).toLocaleString("es-MX")}</div>
+            <div>Vendió: {printSale.sale.sold_by_name || printSale.sale.sold_by_email || "Sin registro"}</div>
+            <div>Pago: {metodoPago(printSale.sale.payment_method)}</div>
+            <hr />
+            {(printSale.sale.items || []).map((i, idx) => (
+              <div key={idx} className="row"><span>{i.product_name} × {i.quantity}</span><b>{fmt(i.subtotal_cents)}</b></div>
+            ))}
+            <div className="row"><span>Total</span><span className="big">{fmt(printSale.sale.total_cents)}</span></div>
+            {printSale.sale.payment_method === "efectivo" && printSale.cashCents != null && (
+              <>
+                <div className="row"><span>Efectivo recibido</span><b>{fmt(printSale.cashCents)}</b></div>
+                <div className="row"><span>Cambio</span><b>{fmt(Math.max(0, printSale.cashCents - printSale.sale.total_cents))}</b></div>
+              </>
+            )}
+            {settings.ticket_message && (<><hr /><div style={{ textAlign: "center" }}>{settings.ticket_message}</div></>)}
+            <div className="no-print" style={{ display: "flex", gap: 8, marginTop: 12 }}>
+              <button className="btn" style={{ flex: 1 }} onClick={() => window.print()}>🖨️ Imprimir ticket</button>
+              <button className="btn sec" onClick={() => setPrintSale(null)}>Cerrar</button>
+            </div>
+          </div>
+        )}
+
         {tab === "Ventas" && (
           <div className="cols">
             <div>
@@ -1055,7 +1126,10 @@ async function load() {
               </div>
               <h2 style={{ marginTop: 20 }}>Ventas recientes</h2>
               {sales.slice(0, 10).map((s) => (
-                <div key={s.id} className="row"><span>{s.folio ? `#${s.folio}` : "Pendiente"} · {s.payment_method} · {new Date(s.created_at).toLocaleString("es-MX")}{s.sold_by_name || s.sold_by_email ? ` · ${s.sold_by_name || s.sold_by_email}` : ""}{s.pending ? " · ⏳ pendiente de sincronizar" : ""}</span><b>{fmt(s.total_cents)}</b></div>
+                <div key={s.id} className="row">
+                  <span>{s.folio ? `#${s.folio}` : "Pendiente"} · {s.payment_method} · {new Date(s.created_at).toLocaleString("es-MX")}{s.sold_by_name || s.sold_by_email ? ` · ${s.sold_by_name || s.sold_by_email}` : ""}{s.pending ? " · ⏳ pendiente de sincronizar" : ""}</span>
+                  <span style={{ display: "flex", gap: 8, alignItems: "center" }}><b>{fmt(s.total_cents)}</b><button className="btn sec" onClick={() => reimprimir(s)}>🖨️ Imprimir</button></span>
+                </div>
               ))}
               {!sales.length && <p className="muted">Aún no hay ventas registradas.</p>}
             </div>
