@@ -240,9 +240,14 @@ cajero; el admin les puede subir el rol desde la pestaña Usuarios.
 - Pestaña **Usuarios** (después de Personalizar, junto a Bitácora, solo
   admin): lista todos los usuarios con correo, rol, fecha de creación y
   último acceso. Acciones por usuario:
-  - **Crear usuario:** correo + contraseña (mín. 6 caracteres) + rol.
-    El correo queda confirmado de inmediato, así que el usuario ya puede
-    entrar sin confirmar por correo.
+  - **Crear usuario:** correo (opcional) + nombre de usuario
+    (obligatorio si no hay correo) + contraseña (mín. 6 caracteres) +
+    rol. Si no se pone correo, la API genera un correo interno
+    sintético `<usuario>@elrodeo.local` (marcado en
+    `user_metadata.internal_email`) que nadie usa: esa persona entra
+    solo con su usuario y contraseña. El correo queda confirmado de
+    inmediato, así que el usuario ya puede entrar sin confirmar por
+    correo.
   - **Cambiar rol:** selector Cajero / Admin por usuario.
   - **Desactivar / Activar:** bloquea el acceso al POS (ban) o lo
     reactiva. Un usuario desactivado no puede entrar aunque tenga su
@@ -262,12 +267,23 @@ cajero; el admin les puede subir el rol desde la pestaña Usuarios.
   (opcional): letras, números, guion bajo (_) y punto (.), mínimo 3
   caracteres, sin espacios. Se guarda en `user_metadata.username` de
   Supabase Auth, en minúsculas.
-- Se asigna al crear el usuario (campo "Usuario (opcional)") o después,
+- Se asigna al crear el usuario (campo "Usuario") o después,
   en la lista de Usuarios: cada cuenta muestra su usuario actual (o
   "sin usuario") y un campo para cambiarlo con el botón "Guardar
   usuario". Dejar el campo vacío quita el usuario y el login queda solo
   por correo. El header muestra `@usuario · correo · rol` cuando la
   cuenta tiene usuario.
+- **Correo opcional al crear:** basta el correo o el nombre de usuario
+  (al menos uno de los dos). Sin correo, el acceso se crea solo con
+  usuario + contraseña y un correo interno `<usuario>@elrodeo.local`
+  que nadie usa (marcado con `user_metadata.internal_email`). En la
+  lista, esas cuentas muestran `@usuario` en negrita y el texto
+  "correo interno, solo entra con su usuario" en lugar de un correo
+  real. Si se le cambia el usuario a una cuenta con correo interno, su
+  correo interno cambia con él; no se le puede quitar el usuario,
+  porque quedaría sin forma de entrar. La cuenta admin principal
+  (`Salvadordominguezcc@gmail.com`) conserva su correo real y nunca
+  lleva correo interno.
 - La pantalla de login tiene un solo campo: **"Correo o nombre de
   usuario"**. Si lo que se escribe lleva @, entra directo con ese
   correo. Si no lleva @, la app lo resuelve a su correo con

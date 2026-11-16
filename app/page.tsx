@@ -16,7 +16,7 @@ type Cut = { id: string; opening_cents: number; expected_cents: number; counted_
 type AccessLog = { id: string; user_id: string | null; user_email: string | null; action: string; created_at: string };
 type Expense = { id: string; description: string; amount_cents: number; category: string | null; created_at: string; pending?: boolean };
 type SessionUser = { id: string; email: string; role: "admin" | "cajero"; username: string | null };
-type AppUser = { id: string; email: string | null; username: string | null; role: "admin" | "cajero"; created_at: string; last_sign_in_at: string | null; banned_until: string | null };
+type AppUser = { id: string; email: string | null; username: string | null; internal_email: boolean; role: "admin" | "cajero"; created_at: string; last_sign_in_at: string | null; banned_until: string | null };
 
 // Evento del navegador para instalar la PWA (Chrome/Android y Edge).
 // No existe en el tipado estándar, por eso se define aquí.
@@ -381,17 +381,21 @@ async function load() {
     }
   }
 
+  // El correo es opcional: basta el correo o el nombre de usuario (al
+  // menos uno de los dos). Sin correo, la API crea el acceso solo con
+  // el usuario y una contraseña (correo interno sintético).
   async function crearUsuario() {
-    const email = nuevoUsuario.email.trim();
-    if (!email || !nuevoUsuario.password) { setUsersError("Escribe el correo y la contraseña del nuevo usuario."); return; }
-    const rol = nuevoUsuario.role;
+    const email = nuevoUsuario.email.trim().toLowerCase();
     const username = nuevoUsuario.username.trim().toLowerCase();
+    if (!email && !username) { setUsersError("Escribe el correo o el nombre de usuario del nuevo usuario (al menos uno de los dos)."); return; }
+    if (!nuevoUsuario.password) { setUsersError("Escribe la contraseña del nuevo usuario."); return; }
+    const rol = nuevoUsuario.role;
     setUsersBusy(true); setUsersError("");
     try {
-      await usersApi("POST", { email, password: nuevoUsuario.password, role: rol, username: username || undefined });
+      await usersApi("POST", { email: email || undefined, password: nuevoUsuario.password, role: rol, username: username || undefined });
       setNuevoUsuario({ email: "", password: "", role: "cajero", username: "" });
       await cargarUsuarios();
-      setMsg(`Usuario ${email} creado con rol ${rol === "admin" ? "admin" : "cajero"}${username ? ` y usuario @${username}` : ""}. Ya puede entrar al POS.`);
+      setMsg(username ? `Usuario @${username} creado con rol ${rol === "admin" ? "admin" : "cajero"}. Ya puede entrar al POS con su usuario y contraseña.` : `Usuario ${email} creado con rol ${rol === "admin" ? "admin" : "cajero"}. Ya puede entrar al POS.`);
     } catch (e: any) {
       setUsersError(e.message || "No se pudo crear el usuario.");
     } finally { setUsersBusy(false); }
@@ -413,7 +417,8 @@ async function load() {
       if (u.id === user?.id) setUser((cur) => (cur ? { ...cur, username: username || null } : cur));
       setEditUsername((v) => { const n = { ...v }; delete n[u.id]; return n; });
       await cargarUsuarios();
-      setMsg(username ? `Nombre de usuario de ${u.email} cambiado a @${username}.` : `Nombre de usuario de ${u.email} quitado: ahora entra solo con su correo.`);
+      const quien = u.username ? `@${u.username}` : (u.email || "este usuario");
+      setMsg(username ? `Nombre de usuario de ${quien} cambiado a @${username}.` : `Nombre de usuario de ${quien} quitado: ahora entra solo con su correo.`);
     } catch (e: any) {
       setUsersError(e.message || "No se pudo cambiar el nombre de usuario.");
     } finally { setUsersBusy(false); }
@@ -1247,16 +1252,16 @@ async function load() {
                 <div className="card" style={{ marginTop: 12, marginBottom: 16 }}>
                   <h2>Crear usuario</h2>
                   <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                    <input style={{ flex: 2, minWidth: 180 }} type="email" placeholder="Correo, ej. cajero@correo.com" value={nuevoUsuario.email} onChange={(e) => setNuevoUsuario({ ...nuevoUsuario, email: e.target.value })} />
+                    <input style={{ flex: 2, minWidth: 180 }} type="email" placeholder="Correo (opcional), ej. cajero@correo.com" value={nuevoUsuario.email} onChange={(e) => setNuevoUsuario({ ...nuevoUsuario, email: e.target.value })} />
                     <input style={{ flex: 1, minWidth: 140 }} type="password" placeholder="Contraseña (mín. 6 caracteres)" value={nuevoUsuario.password} onChange={(e) => setNuevoUsuario({ ...nuevoUsuario, password: e.target.value })} />
-                    <input style={{ flex: 1, minWidth: 140 }} placeholder="Usuario (opcional), ej. cajero1" value={nuevoUsuario.username} onChange={(e) => setNuevoUsuario({ ...nuevoUsuario, username: e.target.value })} />
+                    <input style={{ flex: 1, minWidth: 140 }} placeholder="Usuario, ej. cajero1" value={nuevoUsuario.username} onChange={(e) => setNuevoUsuario({ ...nuevoUsuario, username: e.target.value })} />
                     <select style={{ maxWidth: 130 }} value={nuevoUsuario.role} onChange={(e) => setNuevoUsuario({ ...nuevoUsuario, role: e.target.value })}>
                       <option value="cajero">Cajero</option>
                       <option value="admin">Admin</option>
                     </select>
                     <button className="btn" onClick={crearUsuario} disabled={usersBusy}>{usersBusy ? "Creando…" : "Crear usuario"}</button>
                   </div>
-                  <p className="muted" style={{ marginBottom: 0 }}>El usuario es opcional: con él se puede entrar al POS sin escribir el correo. Solo letras, números, guion bajo (_) y punto (.), mínimo 3 caracteres, sin espacios.</p>
+                  <p className="muted" style={{ marginBottom: 0 }}>El correo es opcional: basta el nombre de usuario y la contraseña para entrar. Si no pones correo, el acceso se crea solo con el usuario. El usuario usa solo letras, números, guion bajo (_) y punto (.), mínimo 3 caracteres, sin espacios.</p>
                   {usersError && <p style={{ color: "#b91c1c", marginTop: 8 }}>{usersError}</p>}
                 </div>
                 {appUsers.map((u) => {
@@ -1266,13 +1271,13 @@ async function load() {
                   return (
                     <div key={u.id} className="card" style={{ marginBottom: 10, opacity: bloqueado ? 0.6 : 1 }}>
                       <div className="row">
-                        <span><b>{u.email || "Sin correo"}</b>{u.username ? ` · @${u.username}` : " · sin usuario"} · {u.role === "admin" ? "Admin" : "Cajero"}{bloqueado ? " · ⛔ Desactivado" : ""}{esYo ? " · (tú)" : ""}</span>
+                        <span><b>{u.username ? `@${u.username}` : (u.email || "Sin correo")}</b>{u.username ? (u.internal_email ? " · correo interno, solo entra con su usuario" : ` · ${u.email}`) : " · sin usuario"} · {u.role === "admin" ? "Admin" : "Cajero"}{bloqueado ? " · ⛔ Desactivado" : ""}{esYo ? " · (tú)" : ""}</span>
                         <span className="muted">Creado: {new Date(u.created_at).toLocaleDateString("es-MX")} · Último acceso: {u.last_sign_in_at ? new Date(u.last_sign_in_at).toLocaleString("es-MX") : "nunca"}</span>
                       </div>
                       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8, alignItems: "center" }}>
                         <input style={{ maxWidth: 180 }} placeholder="Usuario, ej. cajero1" value={editUsername[u.id] ?? u.username ?? ""} onChange={(e) => setEditUsername((v) => ({ ...v, [u.id]: e.target.value }))} />
                         <button className="btn sec" disabled={usersBusy || (editUsername[u.id] ?? u.username ?? "") === (u.username ?? "")} onClick={() => guardarUsuario(u)}>Guardar usuario</button>
-                        <span className="muted">Vacío = entra solo con su correo.</span>
+                        <span className="muted">{u.internal_email ? "Esta cuenta no tiene correo real: necesita un usuario para entrar." : "Vacío = entra solo con su correo."}</span>
                       </div>
                       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
                         <select value={u.role} disabled={usersBusy || esYo || esAdminPrincipal} onChange={(e) => cambiarRolUsuario(u, e.target.value as "admin" | "cajero")}>

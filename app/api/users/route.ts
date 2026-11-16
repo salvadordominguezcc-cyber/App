@@ -95,6 +95,32 @@ type Role = "admin" | "cajero";
 // para que la búsqueda no distinga mayúsculas de minúsculas.
 const USERNAME_RE = /^[a-zA-Z0-9._]{3,}$/;
 
+// Correo interno sintético: cuando un usuario se crea solo con nombre de
+// usuario (sin correo real), Supabase Auth igual exige un correo, así que
+// la API genera `<usuario>@elrodeo.local`. Nadie lo usa para entrar: el
+// login siempre es por el nombre de usuario (la resolución por username
+// lo traduce a este correo interno). Se marca en user_metadata con
+// internal_email = true para distinguirlo de un correo real.
+const INTERNAL_EMAIL_DOMAIN = "elrodeo.local";
+
+function internalEmailFor(username: string): string {
+  return `${normalizeUsername(username)}@${INTERNAL_EMAIL_DOMAIN}`;
+}
+
+function isInternalEmail(email: string | undefined | null): boolean {
+  return !!email && email.toLowerCase().endsWith(`@${INTERNAL_EMAIL_DOMAIN}`);
+}
+
+function isInternalUser(u: {
+  email?: string | null;
+  user_metadata?: Record<string, unknown> | null;
+}): boolean {
+  return (
+    (u.user_metadata as Record<string, unknown> | null)?.internal_email ===
+      true || isInternalEmail(u.email)
+  );
+}
+
 function normalizeUsername(v: unknown): string {
   return String(v || "").trim().toLowerCase();
 }
@@ -214,6 +240,7 @@ export async function GET(req: NextRequest) {
       id: u.id,
       email: u.email ?? null,
       username: normalizeUsername((u.user_metadata as Record<string, unknown> | null)?.username) || null,
+      internal_email: isInternalUser(u),
       role: roleOf(u.email, u.user_metadata),
       created_at: u.created_at,
       last_sign_in_at: u.last_sign_in_at ?? null,
@@ -225,12 +252,19 @@ export async function GET(req: NextRequest) {
   }
 }
 
-// POST — crear usuario: { email, password, role?, username? }.
+// POST — crear usuario: { email?, password, role?, username? }.
+// El correo es OPCIONAL: basta el correo o el nombre de usuario (al
+// menos uno de los dos). Si no se pone correo pero sí usuario, se genera
+// un correo interno sintético `<usuario>@elrodeo.local` y se crea el
+// usuario en Supabase Auth con ese correo + la contraseña +
+// user_metadata { role, username, internal_email: true }. Esa persona
+// entra solo con su usuario y contraseña; el correo interno nadie lo usa.
 // Rol por defecto: cajero. El correo queda confirmado (email_confirm)
 // para que pueda entrar de inmediato sin confirmar por correo.
-// username es opcional: si se da, debe ser único entre los usuarios
-// (se rechaza con error claro si ya está en uso) y se guarda en
-// user_metadata.username para poder entrar con usuario + contraseña.
+// username es obligatorio cuando no hay correo; si se da, debe ser único
+// entre los usuarios (se rechaza con error claro si ya está en uso) y se
+// guarda en user_metadata.username para poder entrar con usuario +
+// contraseña.
 export async function POST(req: NextRequest) {
   const caller = await callerIsAdmin(req);
   if (!caller) return forbidden();
@@ -241,12 +275,17 @@ export async function POST(req: NextRequest) {
   const password = String(body.password || "");
   const role: Role = body.role === "admin" ? "admin" : "cajero";
   const username = normalizeUsername(body.username);
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
+  if (!email && !username)
+    return bad("Escribe el correo o el nombre de usuario del nuevo usuario (al menos uno de los dos).");
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
     return bad("Escribe un correo válido.");
   if (password.length < 6)
     return bad("La contraseña debe tener al menos 6 caracteres.");
   if (username && !usernameValid(username))
     return bad("El nombre de usuario debe tener al menos 3 caracteres y solo puede usar letras, números, guion bajo (_) y punto (.), sin espacios.");
+  // Sin correo real: correo interno sintético a partir del usuario.
+  const internalEmail = !email;
+  const finalEmail = internalEmail ? internalEmailFor(username) : email;
   try {
     if (username) {
       const taken = await findUserByUsername(admin, username);
@@ -254,13 +293,21 @@ export async function POST(req: NextRequest) {
         return bad("Ese nombre de usuario ya está en uso. Elige otro.");
     }
     const { data, error } = await admin.auth.admin.createUser({
-      email,
+      email: finalEmail,
       password,
       email_confirm: true,
-      user_metadata: username ? { role, username } : { role },
+      user_metadata: internalEmail
+        ? { role, username, internal_email: true }
+        : username
+          ? { role, username }
+          : { role },
     });
-    if (error) return supabaseError(translateCreateError(error.message), 400);
-    return NextResponse.json({ ok: true, id: data.user?.id ?? null });
+    if (error) {
+      if (error.message.includes("User already registered") && internalEmail)
+        return supabaseError("Ese nombre de usuario ya está en uso. Elige otro.", 400);
+      return supabaseError(translateCreateError(error.message), 400);
+    }
+    return NextResponse.json({ ok: true, id: data.user?.id ?? null, internal_email: internalEmail });
   } catch (e: any) {
     return supabaseError("No se pudo crear el usuario: " + (e?.message || e));
   }
@@ -296,17 +343,23 @@ export async function PATCH(req: NextRequest) {
     const isAdminPrincipal = target.user.email?.toLowerCase() === ADMIN_EMAIL;
     if ((hasRole || hasBanned) && isAdminPrincipal)
       return bad("La cuenta admin principal no se puede modificar desde aquí.");
+    // Cuenta con correo interno: su correo sintético sigue a su usuario.
+    const targetInternal = isInternalUser(target.user);
     // Se acumulan los cambios de metadata en un solo objeto para que el
     // cambio de usuario y el de rol no se pisen entre sí.
     const meta: Record<string, unknown> = { ...(target.user.user_metadata || {}) };
+    let newInternalEmail: string | null = null;
     if (hasUsername) {
       const username = normalizeUsername(body.username);
       if (username && !usernameValid(username))
         return bad("El nombre de usuario debe tener al menos 3 caracteres y solo puede usar letras, números, guion bajo (_) y punto (.), sin espacios.");
+      if (!username && targetInternal)
+        return bad("Esta cuenta no tiene correo real: necesita un nombre de usuario para entrar. Ponle un usuario en lugar de quitarlo.");
       if (username) {
         const taken = await findUserByUsername(admin, username);
         if (taken && taken.id !== id)
           return bad("Ese nombre de usuario ya está en uso. Elige otro.");
+        if (targetInternal) newInternalEmail = internalEmailFor(username);
       }
       meta.username = username || null;
     }
@@ -316,6 +369,7 @@ export async function PATCH(req: NextRequest) {
     if (hasUsername || hasRole) {
       const { error } = await admin.auth.admin.updateUserById(id, {
         user_metadata: meta,
+        ...(newInternalEmail ? { email: newInternalEmail } : {}),
       });
       if (error) return supabaseError("No se pudo actualizar el usuario: " + error.message);
     }
