@@ -19,7 +19,7 @@ export const metadata: Metadata = {
 
 // En Next 14 el color del tema va en el export viewport, no en metadata.
 export const viewport: Viewport = {
-  themeColor: "#c2410c",
+  themeColor: "#1a120b",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

@@ -82,6 +82,9 @@ export default function POS() {
   const [tab, setTab] = useState("Ventas");
   const [products, setProducts] = useState<Product[]>(SEED_PRODUCTS);
   const [settings, setSettings] = useState<any>(SEED_SETTINGS);
+  // Tema visual: el diseño oscuro es el principal; solo si el tema guardado
+  // en Personalizar es "claro" se respeta el tema claro.
+  useEffect(() => { document.body.dataset.theme = settings.theme === "claro" ? "claro" : "oscuro"; }, [settings.theme]);
   const [sales, setSales] = useState<Sale[]>([]);
   const [cuts, setCuts] = useState<Cut[]>([]);
   const [ticket, setTicket] = useState<Line[]>([]);
@@ -1012,7 +1015,7 @@ async function load() {
         <input type="text" value={loginEmail} onChange={(e) => setLoginEmail(e.target.value)} placeholder="tu@correo.com o tu usuario" onKeyDown={(e) => { if (e.key === "Enter") entrar(); }} />
         <label>Contraseña</label>
         <input type="password" value={loginPass} onChange={(e) => setLoginPass(e.target.value)} placeholder="Tu contraseña" onKeyDown={(e) => { if (e.key === "Enter") entrar(); }} />
-        {loginError && <p style={{ color: "#b91c1c" }}>{loginError}</p>}
+        {loginError && <p className="err">{loginError}</p>}
         <button className="btn" style={{ width: "100%", marginTop: 12 }} disabled={loginLoading || !supabaseConfigured} onClick={entrar}>
           {loginLoading ? "Entrando…" : "Entrar"}
         </button>
@@ -1024,8 +1027,8 @@ async function load() {
           <div style={{ marginTop: 12, borderTop: "1px solid #eee", paddingTop: 12 }}>
             <label>Correo para recuperar tu contraseña</label>
             <input type="email" value={recoveryEmail} onChange={(e) => setRecoveryEmail(e.target.value)} placeholder="tu@correo.com" onKeyDown={(e) => { if (e.key === "Enter") pedirRecuperacion(); }} />
-            {recoveryError && <p style={{ color: "#b91c1c" }}>{recoveryError}</p>}
-            {recoveryMsg && <p style={{ color: "#166534" }}>{recoveryMsg}</p>}
+            {recoveryError && <p className="err">{recoveryError}</p>}
+            {recoveryMsg && <p className="ok-text">{recoveryMsg}</p>}
             <button className="btn" style={{ width: "100%", marginTop: 8 }} disabled={recoveryLoading || !supabaseConfigured} onClick={pedirRecuperacion}>
               {recoveryLoading ? "Enviando…" : "Enviar enlace de recuperación"}
             </button>
@@ -1049,7 +1052,7 @@ async function load() {
           ) : (
             <img src="/icon.svg" alt="Logo de EL RODEO" style={{ width: 48, height: 48, objectFit: "cover", borderRadius: "50%", background: "#fff", flexShrink: 0 }} />
           )}
-          <div><h1>{settings.business_name}</h1><p>{settings.slogan} · Punto de venta</p></div>
+          <div><h1>{settings.business_name}</h1><p>{settings.slogan} · <span className="coral">Punto de Venta</span></p></div>
         </div>
         <div style={{ textAlign: "right" }}>
           <p>{online ? "🟢 En línea" : "🔴 Sin internet — modo offline"}{supabaseConfigured ? " · Conectado a Supabase" : " · Sin conexión a Supabase"}</p>
@@ -1069,7 +1072,7 @@ async function load() {
       )}
       <nav>{visibleTabs.map((t) => (<button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>{t}</button>))}</nav>
       <main>
-        {msg && <p className="card" style={{ background: "#eff6ff" }}>{msg} <button className="btn sec" onClick={() => setMsg("")}>✕</button></p>}
+        {msg && <p className="card msgcard">{msg} <button className="btn sec" onClick={() => setMsg("")}>✕</button></p>}
 
         {printSale && (
           <div id="ticket-print" className="ticket-print">
@@ -1345,11 +1348,11 @@ async function load() {
             <h2 style={{ marginTop: 24 }}>Instalar como app</h2>
             <p className="muted">Instala el POS como app en el celular o la computadora para abrirlo sin internet, como una app normal, sin entrar al navegador.</p>
             {isStandalone ? (
-              <p className="card" style={{ background: "#eff6ff" }}>✅ Ya estás usando la app instalada.</p>
+              <p className="card msgcard">✅ Ya estás usando la app instalada.</p>
             ) : installEvent ? (
               <button className="btn" onClick={instalarApp}>Instalar app EL RODEO</button>
             ) : (
-              <div className="card" style={{ background: "#fffbeb" }}>
+              <div className="card msgcard">
                 <p style={{ marginTop: 0 }}><b>Para instalarla desde el navegador:</b></p>
                 <p style={{ marginBottom: 4 }}>• <b>Android (Chrome):</b> menú ⋮ → “Instalar app” o “Agregar a pantalla principal”.</p>
                 <p style={{ marginBottom: 4 }}>• <b>iPhone (Safari):</b> botón Compartir → “Agregar a inicio”.</p>
@@ -1410,7 +1413,7 @@ async function load() {
                     <button className="btn" onClick={crearUsuario} disabled={usersBusy}>{usersBusy ? "Creando…" : "Crear usuario"}</button>
                   </div>
                   <p className="muted" style={{ marginBottom: 0 }}>El correo es opcional: basta el nombre de usuario y la contraseña para entrar. Si no pones correo, el acceso se crea solo con el usuario. El usuario usa solo letras, números, guion bajo (_) y punto (.), mínimo 3 caracteres, sin espacios.</p>
-                  {usersError && <p style={{ color: "#b91c1c", marginTop: 8 }}>{usersError}</p>}
+                  {usersError && <p className="err" style={{ marginTop: 8 }}>{usersError}</p>}
                 </div>
                 {appUsers.map((u) => {
                   const bloqueado = !!u.banned_until && new Date(u.banned_until) > new Date();
