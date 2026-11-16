@@ -3,7 +3,7 @@
 POS standalone de EL RODEO para usar fuera de Muse con link público.
 
 ## Qué incluye
-- Ventas: rejilla de productos, atajos de kilo ¼ / ½ / 1 kg, ticket, efectivo (con cambio) / tarjeta / transferencia, folio.
+- Ventas: rejilla de productos, atajos de kilo ¼ / ½ / 1 kg, ticket, efectivo (con cambio) / tarjeta / transferencia, folio. Opción "Otros · Precio variable": descripción opcional, monto y cantidad; se agrega al ticket como renglón "Otros" (o "Otros: <descripción>"), se cobra como una venta normal y se guarda en `sale_items` con `product_id` null, sin agregarse al catálogo ni a `products`. Funciona también sin internet (va a la cola offline).
 - Imprimir ticket: después de cobrar aparece el comprobante (logo, negocio, dirección, horario, folio o "Pendiente" si es offline, fecha y hora, quién vendió, renglones, total, pago y cambio si fue en efectivo, mensaje del ticket) con el botón "🖨️ Imprimir ticket" (window.print, CSS de impresión: solo sale el comprobante en formato angosto de 80 mm, en celular abre el diálogo de imprimir/compartir del sistema). Cada venta de "Ventas recientes" tiene su botón "🖨️ Imprimir" para reimprimirlo; si la venta no trae renglones guardados, se avisa en lugar de imprimir un ticket vacío. Imprimir o reimprimir no duplica la venta.
 - Catálogo: agregar, editar y quitar productos del menú. Sin stock: las ventas ya NO descuentan stock ni crean movimientos de inventario.
 - Gastos: registrar gastos del día (descripción, monto, categoría) y ver el total del día. Se descuentan del efectivo esperado en el corte de caja. Ver "Gastos" abajo.

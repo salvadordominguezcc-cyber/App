@@ -101,6 +101,11 @@ export default function POS() {
   const [fondo, setFondo] = useState(500);
   const [contado, setContado] = useState("");
   const [nuevo, setNuevo] = useState({ name: "", price: "", unit: "pieza", description: "" });
+  // "Otros" con precio variable: cobro de artículos que no están en el
+  // menú. No se agrega al catálogo ni a products: solo va al ticket de
+  // esa venta, con product_id null en Supabase.
+  const [showOtros, setShowOtros] = useState(false);
+  const [otros, setOtros] = useState({ desc: "", amount: "", qty: "1" });
   const [edit, setEdit] = useState<Record<string, { name: string; price: string; unit: string; description: string }>>({});
   // Login por persona (Supabase Auth) + bitácora de accesos (solo admin).
   const [user, setUser] = useState<SessionUser | null>(null);
@@ -682,6 +687,22 @@ async function load() {
     });
   }
 
+  // "Otros" con precio variable: se agrega al ticket como renglón
+  // "Otros" (o "Otros: <descripción>") con el monto escrito. Cada vez
+  // es un renglón nuevo (id único), así se puede cobrar varias veces en
+  // el mismo ticket con montos distintos. No toca el catálogo.
+  function agregarOtros() {
+    const amountCents = Math.round(parseFloat(otros.amount || "0") * 100);
+    const qty = parseFloat(otros.qty || "1");
+    if (!otros.amount.trim() || isNaN(amountCents) || amountCents <= 0) { setMsg("Para cobrar \"Otros\" escribe un monto válido mayor a $0."); return; }
+    if (!otros.qty.trim() || isNaN(qty) || qty <= 0) { setMsg("Para cobrar \"Otros\" escribe una cantidad válida mayor a 0."); return; }
+    const desc = otros.desc.trim();
+    const prod: Product = { id: "seed-otros-" + crypto.randomUUID(), name: desc ? `Otros: ${desc}` : "Otros", price_cents: amountCents, unit: "", category: "Otros", description: desc, stock: 0, min_stock: 0, active: true };
+    addToTicket(prod, qty);
+    setOtros({ desc: "", amount: "", qty: "1" });
+    setShowOtros(false);
+  }
+
   async function cobrar() {
     if (!ticket.length) return;
     // Folio: solo de las ventas YA sincronizadas (sin pendientes, que aún
@@ -1126,6 +1147,21 @@ async function load() {
                     ) : (<div className="qty"><button onClick={() => addToTicket(p, 1)}>+ Agregar</button></div>)}
                   </div>
                 ))}
+              </div>
+              <div className="card prod" style={{ marginTop: 12 }}>
+                <b>Otros · Precio variable</b>
+                <span className="muted">Para cobrar artículos que no están en el menú. No se agrega al catálogo.</span>
+                {showOtros ? (
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                    <input style={{ flex: 2, minWidth: 140 }} placeholder="Descripción (opcional), ej. vaso extra" value={otros.desc} onChange={(e) => setOtros({ ...otros, desc: e.target.value })} />
+                    <input style={{ maxWidth: 130 }} type="number" placeholder="Monto $" value={otros.amount} onChange={(e) => setOtros({ ...otros, amount: e.target.value })} />
+                    <input style={{ maxWidth: 90 }} type="number" placeholder="Cant. 1" value={otros.qty} onChange={(e) => setOtros({ ...otros, qty: e.target.value })} />
+                    <button className="btn" onClick={agregarOtros}>Agregar al ticket</button>
+                    <button className="btn sec" onClick={() => setShowOtros(false)}>Cancelar</button>
+                  </div>
+                ) : (
+                  <div className="qty"><button onClick={() => setShowOtros(true)}>+ Agregar otro</button></div>
+                )}
               </div>
               <h2 style={{ marginTop: 20 }}>Ventas recientes</h2>
               {sales.slice(0, 10).map((s) => (
