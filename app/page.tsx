@@ -18,6 +18,13 @@ type Expense = { id: string; description: string; amount_cents: number; category
 type SessionUser = { id: string; email: string; role: "admin" | "cajero" };
 type AppUser = { id: string; email: string | null; role: "admin" | "cajero"; created_at: string; last_sign_in_at: string | null; banned_until: string | null };
 
+// Evento del navegador para instalar la PWA (Chrome/Android y Edge).
+// No existe en el tipado estándar, por eso se define aquí.
+type BeforeInstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: "accepted" | "dismissed" }>;
+};
+
 // Fecha local del negocio (America/Tijuana) en formato YYYY-MM-DD, para
 // agrupar los gastos (y las ventas) "de hoy" como los ve el usuario.
 function localDay(iso: string) {
@@ -86,6 +93,12 @@ export default function POS() {
   const [queue, setQueue] = useState<OfflineItem[]>([]);
   const [syncing, setSyncing] = useState(false);
   const syncingRef = useRef(false);
+  // Instalar como app (PWA): el navegador avisa con "beforeinstallprompt"
+  // cuando la app se puede instalar (Chrome/Android y Edge). En iPhone no
+  // hay aviso: se instala desde Compartir → "Agregar a inicio".
+  const [installEvent, setInstallEvent] = useState<BeforeInstallPromptEvent | null>(null);
+  const [isStandalone, setIsStandalone] = useState(false);
+  const [installMsg, setInstallMsg] = useState("");
 
   const isAdmin = !!user && user.role === "admin";
   const visibleTabs = (isAdmin ? ADMIN_TABS : BASE_TABS) as readonly string[];
@@ -415,6 +428,47 @@ export default function POS() {
       window.removeEventListener("offline", onOffline);
     };
   }, []);
+  // Instalar como app (PWA): guarda el evento del navegador para ofrecer
+  // "Instalar app" desde el header y desde Personalizar. Detecta si la app
+  // ya está instalada (se abrió en modo standalone, sin barra del navegador).
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const standalone =
+      window.matchMedia("(display-mode: standalone)").matches ||
+      (window.navigator as any).standalone === true;
+    setIsStandalone(standalone);
+    const onPrompt = (e: Event) => {
+      e.preventDefault();
+      setInstallEvent(e as BeforeInstallPromptEvent);
+    };
+    const onInstalled = () => {
+      setIsStandalone(true);
+      setInstallEvent(null);
+      setInstallMsg("✅ App instalada. Ya puedes abrir el POS desde tu pantalla principal, con o sin internet.");
+    };
+    window.addEventListener("beforeinstallprompt", onPrompt);
+    window.addEventListener("appinstalled", onInstalled);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", onPrompt);
+      window.removeEventListener("appinstalled", onInstalled);
+    };
+  }, []);
+
+  async function instalarApp() {
+    if (!installEvent) return;
+    try {
+      await installEvent.prompt();
+      const choice = await installEvent.userChoice;
+      if (choice.outcome === "accepted") {
+        setInstallMsg("Instalando app…");
+      } else {
+        setInstallMsg("Instalación cancelada. Puedes intentarlo de nuevo cuando quieras.");
+      }
+    } catch {
+      setInstallMsg("No se pudo abrir la instalación. Inténtalo desde el menú del navegador: “Instalar app” o “Agregar a pantalla principal”.");
+    }
+    setInstallEvent(null);
+  }
   // Si el usuario pierde acceso a la pestaña actual (por ejemplo, el admin
   // le cambió el rol a cajero), se le regresa a Ventas.
   useEffect(() => {
@@ -666,6 +720,7 @@ export default function POS() {
           <p>{loading ? "Cargando…" : `${products.length} productos · ${sales.length} ventas`}{queue.length > 0 ? ` · ⏳ ${queue.length} ${queue.length === 1 ? "pendiente" : "pendientes"} de sincronizar` : ""}</p>
           <p className="muted">{user?.email} · {user?.role === "admin" ? "Admin" : "Cajero"}</p>
           {queue.length > 0 && online && (<button className="btn sec" onClick={() => void syncQueue()} disabled={syncing} style={{ marginRight: 8 }}>{syncing ? "Sincronizando…" : "Sincronizar ahora"}</button>)}
+          {installEvent && !isStandalone && (<button className="btn sec" onClick={instalarApp} style={{ marginRight: 8 }}>📲 Instalar app</button>)}
           <button className="btn sec" onClick={salir}>Cerrar sesión</button>
         </div>
       </header>
@@ -889,6 +944,22 @@ export default function POS() {
             <label>Fondo inicial de caja (centavos)</label>
             <input type="number" value={settings.initial_cash_cents ?? 50000} onChange={(e) => setSettings({ ...settings, initial_cash_cents: parseInt(e.target.value) || 0 })} />
             <button className="btn" onClick={guardarSettings}>Guardar datos del negocio</button>
+            <h2 style={{ marginTop: 24 }}>Instalar como app</h2>
+            <p className="muted">Instala el POS como app en el celular o la computadora para abrirlo sin internet, como una app normal, sin entrar al navegador.</p>
+            {isStandalone ? (
+              <p className="card" style={{ background: "#eff6ff" }}>✅ Ya estás usando la app instalada.</p>
+            ) : installEvent ? (
+              <button className="btn" onClick={instalarApp}>📲 Instalar app EL RODEO</button>
+            ) : (
+              <div className="card" style={{ background: "#fffbeb" }}>
+                <p style={{ marginTop: 0 }}><b>Para instalarla desde el navegador:</b></p>
+                <p style={{ marginBottom: 4 }}>• <b>Android (Chrome):</b> menú ⋮ → “Instalar app” o “Agregar a pantalla principal”.</p>
+                <p style={{ marginBottom: 4 }}>• <b>iPhone (Safari):</b> botón Compartir → “Agregar a inicio”.</p>
+                <p style={{ marginBottom: 0 }}>• <b>Computadora (Chrome/Edge):</b> icono de instalar en la barra de dirección o menú → “Instalar EL RODEO POS”.</p>
+              </div>
+            )}
+            {installMsg && <p style={{ marginTop: 8 }}>{installMsg}</p>}
+            <p className="muted">La primera instalación y el primer login necesitan internet. Después, la app abre sin internet con la sesión ya iniciada y el menú cargado, y vende en modo offline.</p>
           </div>
         )}
 

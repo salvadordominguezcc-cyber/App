@@ -108,6 +108,57 @@ alter table public.expenses disable row level security;
   - El login sí necesita internet la primera vez (la sesión se restaura
     sin internet si ya estaba iniciada en ese navegador).
 
+## Instalar como app (PWA)
+
+El POS es una app instalable (PWA): se instala en el celular o la
+computadora y abre como una app normal, sin barra del navegador, y **abre
+sin internet aunque no se haya abierto antes** (siempre que ya se haya
+instalado y se haya entrado al menos una vez con internet).
+
+- **Archivos:** `public/manifest.json` (nombre, colores, iconos),
+  `public/sw.js` (service worker), `public/icon-192.png`,
+  `public/icon-512.png`, `public/apple-touch-icon.png` y el registro en
+  `app/sw-register.tsx` (llamado desde `app/layout.tsx`). El botón de
+  instalación vive en `app/page.tsx` (header y pestaña Personalizar, solo
+  admin). Para el push, los archivos nuevos en `public/` deben ir en la
+  lista de archivos junto con `app/layout.tsx`, `app/page.tsx` y
+  `app/sw-register.tsx`.
+- **Qué hace el service worker (`public/sw.js`, caché
+  `el-rodeo-pos-v1`):** en la primera visita con internet guarda el shell
+  de la app (la página `/`, el manifiesto, los iconos y los archivos
+  JS/CSS de `/_next/static/`). Después, sin internet, sirve ese shell
+  guardado y el POS arranca en modo offline con la sesión restaurada y
+  la cola de pendientes. Con internet, las páginas se traen siempre de
+  la red primero (versión nueva) y el caché solo es respaldo. **Nunca
+  guarda en caché** llamadas a Supabase ni a `/api/*` (datos y login no
+  se cachean); eso lo maneja la cola offline de `lib/offline.ts`. Para
+  forzar a todos los equipos a tomar una versión nueva del shell, sube
+  `CACHE_NAME` (por ejemplo a `el-rodeo-pos-v2`).
+- **Cómo se instala:**
+  - **Android (Chrome):** abre el POS, toca el botón **"📲 Instalar
+    app"** del header (o de Personalizar) o menú ⋮ → "Instalar app" /
+    "Agregar a pantalla principal".
+  - **iPhone (Safari):** no hay botón automático: botón Compartir →
+    "Agregar a inicio". (En iPhone el service worker y el modo offline
+    funcionan desde Safari; la instalación es solo un acceso directo a
+    pantalla principal.)
+  - **Computadora (Chrome/Edge):** icono de instalar en la barra de
+    dirección o menú → "Instalar EL RODEO POS".
+  - Si el navegador no ofrece el botón, la app igual queda guardada en
+    caché al visitarla y se puede abrir desde el historial, pero para
+    abrir sin internet desde cero conviene instalarla.
+- **Límites (importante):**
+  - La **primera instalación y el primer login necesitan internet** (la
+    app y la sesión tienen que bajar al equipo al menos una vez).
+  - El menú y los datos del negocio que se ven sin internet son los que
+    ya se habían cargado en ese equipo; los cambios de catálogo y de
+    Personalizar necesitan internet.
+  - Si se desinstala la app o se borran los datos del navegador, hay que
+    volver a instalarla y entrar con internet, y los pendientes sin
+    sincronizar se pierden (igual que en el modo sin internet).
+  - Cada equipo instala su propia copia: hay que instalarla en cada
+    celular/computadora que la vaya a usar.
+
 ## Login y bitácora
 
 - Login con Supabase Auth (email + contraseña, `supabase.auth.signInWithPassword`).
