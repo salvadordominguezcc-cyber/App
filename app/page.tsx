@@ -8,7 +8,8 @@ type Sale = { id: string; folio: number; total_cents: number; payment_method: st
 type Cut = { id: string; opening_cents: number; expected_cents: number; counted_cents: number; difference_cents: number; created_at: string; status: string };
 type AccessLog = { id: string; user_id: string | null; user_email: string | null; action: string; created_at: string };
 type Expense = { id: string; description: string; amount_cents: number; category: string | null; created_at: string };
-type SessionUser = { id: string; email: string };
+type SessionUser = { id: string; email: string; role: "admin" | "cajero" };
+type AppUser = { id: string; email: string | null; role: "admin" | "cajero"; created_at: string; last_sign_in_at: string | null; banned_until: string | null };
 
 // Fecha local del negocio (America/Tijuana) en formato YYYY-MM-DD, para
 // agrupar los gastos (y las ventas) "de hoy" como los ve el usuario.
@@ -16,16 +17,26 @@ function localDay(iso: string) {
   return new Date(iso).toLocaleDateString("en-CA", { timeZone: "America/Tijuana" });
 }
 
-// Cuenta admin principal: solo este correo ve la pestaña "Bitácora".
-// Los usuarios se crean en el panel de Supabase Auth (Authentication → Users),
-// la app no tiene registro.
+// Cuenta admin principal: solo este correo ve las pestañas "Bitácora" y
+// "Usuarios". Los usuarios se crean desde la pestaña Usuarios (o en el
+// panel de Supabase Auth, Authentication → Users); la app no tiene registro.
 const ADMIN_EMAIL = "salvadordominguezcc@gmail.com";
 
-const BASE_TABS = ["Ventas", "Catálogo", "Gastos", "Corte de caja", "Reportes", "Personalizar"] as const;
-const TABS = [...BASE_TABS, "Bitácora"] as const;
+// Rol del usuario: se guarda en user_metadata.role de Supabase Auth
+// ("admin" o "cajero"). El correo ADMIN_EMAIL siempre es admin aunque no
+// tenga el metadata. Los usuarios nuevos se crean con rol cajero.
+function roleOf(user: { user_metadata?: any } | null, email: string): "admin" | "cajero" {
+  if (email.toLowerCase() === ADMIN_EMAIL) return "admin";
+  return user?.user_metadata?.role === "admin" ? "admin" : "cajero";
+}
+
+// Cajero: Ventas, Catálogo, Gastos, Corte de caja y Reportes.
+// Admin: todo lo anterior + Personalizar, Bitácora y Usuarios.
+const BASE_TABS = ["Ventas", "Catálogo", "Gastos", "Corte de caja", "Reportes"] as const;
+const ADMIN_TABS = [...BASE_TABS, "Personalizar", "Bitácora", "Usuarios"] as const;
 
 export default function POS() {
-  const [tab, setTab] = useState<(typeof TABS)[number]>("Ventas");
+  const [tab, setTab] = useState("Ventas");
   const [products, setProducts] = useState<Product[]>(SEED_PRODUCTS);
   const [settings, setSettings] = useState<any>(SEED_SETTINGS);
   const [sales, setSales] = useState<Sale[]>([]);
@@ -50,13 +61,19 @@ export default function POS() {
   const [loginLoading, setLoginLoading] = useState(false);
   const [logEntries, setLogEntries] = useState<AccessLog[]>([]);
   const [logStatus, setLogStatus] = useState<"idle" | "loading" | "ok" | "missing" | "error">("idle");
+  // Gestión de usuarios (solo admin, vía /api/users con service_role).
+  const [appUsers, setAppUsers] = useState<AppUser[]>([]);
+  const [usersStatus, setUsersStatus] = useState<"idle" | "loading" | "ok" | "no-service-key" | "error">("idle");
+  const [usersError, setUsersError] = useState("");
+  const [usersBusy, setUsersBusy] = useState(false);
+  const [nuevoUsuario, setNuevoUsuario] = useState({ email: "", password: "", role: "cajero" });
   // Gastos del día (salidas de caja). Sin stock ni inventario.
   const [expenses, setExpenses] = useState<Expense[]>([]);
   const [expenseStatus, setExpenseStatus] = useState<"idle" | "loading" | "ok" | "missing" | "error">("idle");
   const [gasto, setGasto] = useState({ description: "", amount: "", category: "Insumos" });
 
-  const isAdmin = !!user && user.email.toLowerCase() === ADMIN_EMAIL;
-  const visibleTabs = (isAdmin ? TABS : BASE_TABS) as readonly string[];
+  const isAdmin = !!user && user.role === "admin";
+  const visibleTabs = (isAdmin ? ADMIN_TABS : BASE_TABS) as readonly string[];
 
   const total = ticket.reduce((s, l) => s + l.product.price_cents * l.qty, 0);
   const cambio = pay === "efectivo" && cash ? Math.max(0, Math.round(parseFloat(cash) * 100) - total) : 0;
@@ -120,6 +137,96 @@ export default function POS() {
     }
   }
 
+  // Gestión de usuarios vía /api/users (server-side, llave service_role).
+  // El navegador nunca ve la llave: solo manda el access token de la sesión
+  // como Bearer y la ruta verifica que quien llama sea admin.
+  async function usersApi(method: string, body?: any) {
+    if (!supabase) throw new Error("Supabase no está conectado.");
+    const { data } = await supabase.auth.getSession();
+    const token = data.session?.access_token;
+    if (!token) throw new Error("Tu sesión expiró. Vuelve a entrar.");
+    const res = await fetch("/api/users", {
+      method,
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const json = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err: any = new Error(json.message || json.error || "Error del servidor.");
+      err.code = json.code || json.error;
+      err.status = res.status;
+      throw err;
+    }
+    return json;
+  }
+
+  async function cargarUsuarios() {
+    setUsersStatus("loading");
+    setUsersError("");
+    try {
+      const json = await usersApi("GET");
+      setAppUsers((json.users || []) as AppUser[]);
+      setUsersStatus("ok");
+    } catch (e: any) {
+      if (e.code === "SERVICE_ROLE_MISSING" || e.status === 503) setUsersStatus("no-service-key");
+      else { setUsersStatus("error"); setUsersError(e.message || "No se pudieron cargar los usuarios."); }
+    }
+  }
+
+  async function crearUsuario() {
+    const email = nuevoUsuario.email.trim();
+    if (!email || !nuevoUsuario.password) { setUsersError("Escribe el correo y la contraseña del nuevo usuario."); return; }
+    const rol = nuevoUsuario.role;
+    setUsersBusy(true); setUsersError("");
+    try {
+      await usersApi("POST", { email, password: nuevoUsuario.password, role: rol });
+      setNuevoUsuario({ email: "", password: "", role: "cajero" });
+      await cargarUsuarios();
+      setMsg(`Usuario ${email} creado con rol ${rol === "admin" ? "admin" : "cajero"}. Ya puede entrar al POS.`);
+    } catch (e: any) {
+      setUsersError(e.message || "No se pudo crear el usuario.");
+    } finally { setUsersBusy(false); }
+  }
+
+  async function cambiarRolUsuario(u: AppUser, role: "admin" | "cajero") {
+    if (u.role === role) return;
+    setUsersBusy(true); setUsersError("");
+    try {
+      await usersApi("PATCH", { id: u.id, role });
+      await cargarUsuarios();
+      setMsg(`Rol de ${u.email || "usuario"} cambiado a ${role}.`);
+    } catch (e: any) {
+      setUsersError(e.message || "No se pudo cambiar el rol.");
+    } finally { setUsersBusy(false); }
+  }
+
+  async function toggleBloqueoUsuario(u: AppUser) {
+    const bloqueado = !!u.banned_until && new Date(u.banned_until) > new Date();
+    if (!window.confirm(bloqueado
+      ? `¿Activar el acceso de ${u.email || "este usuario"}? Volverá a poder entrar al POS.`
+      : `¿Desactivar el acceso de ${u.email || "este usuario"}? Ya no podrá entrar al POS hasta que lo actives de nuevo.`)) return;
+    setUsersBusy(true); setUsersError("");
+    try {
+      await usersApi("PATCH", { id: u.id, banned: !bloqueado });
+      await cargarUsuarios();
+      setMsg(bloqueado ? `${u.email} activado.` : `${u.email} desactivado: ya no puede entrar al POS.`);
+    } catch (e: any) {
+      setUsersError(e.message || `No se pudo ${bloqueado ? "activar" : "desactivar"} al usuario.`);
+    } finally { setUsersBusy(false); }
+  }
+
+  async function eliminarUsuario(u: AppUser) {
+    if (!window.confirm(`¿Eliminar definitivamente al usuario ${u.email || ""}? Esta acción no se puede deshacer.`)) return;
+    setUsersBusy(true); setUsersError("");
+    try {
+      await usersApi("DELETE", { id: u.id });
+      await cargarUsuarios();
+      setMsg(`Usuario ${u.email} eliminado.`);
+    } catch (e: any) {
+      setUsersError(e.message || "No se pudo eliminar el usuario.");
+    } finally { setUsersBusy(false); }
+  }
+
   async function entrar() {
     if (!supabase) { setLoginError("Supabase no está conectado: falta la llave anon en Vercel."); return; }
     if (!loginEmail.trim() || !loginPass) { setLoginError("Escribe tu correo y tu contraseña."); return; }
@@ -139,11 +246,11 @@ export default function POS() {
       );
       return;
     }
-    const u: SessionUser = { id: data.user.id, email: data.user.email };
+    const u: SessionUser = { id: data.user.id, email: data.user.email, role: roleOf(data.user, data.user.email) };
     setUser(u);
     setLoginPass("");
     await logAccess(u, "login");
-    if (u.email.toLowerCase() === ADMIN_EMAIL) await cargarBitacora();
+    if (u.role === "admin") await cargarBitacora();
   }
 
   async function salir() {
@@ -165,15 +272,22 @@ export default function POS() {
         const { data } = await supabase.auth.getSession();
         const s = data.session?.user;
         if (s?.email) {
-          const u: SessionUser = { id: s.id, email: s.email };
+          const u: SessionUser = { id: s.id, email: s.email, role: roleOf(s, s.email) };
           setUser(u);
-          if (u.email.toLowerCase() === ADMIN_EMAIL) await cargarBitacora();
+          if (u.role === "admin") await cargarBitacora();
         }
       }
       setAuthChecked(true);
     })();
   }, []);
   useEffect(() => { if (user) load(); }, [user]);
+  // Si el usuario pierde acceso a la pestaña actual (por ejemplo, el admin
+  // le cambió el rol a cajero), se le regresa a Ventas.
+  useEffect(() => {
+    if (!visibleTabs.includes(tab)) setTab("Ventas");
+  }, [isAdmin, tab]);
+  // La lista de usuarios se carga al abrir la pestaña Usuarios (solo admin).
+  useEffect(() => { if (tab === "Usuarios" && isAdmin) cargarUsuarios(); }, [tab, isAdmin]);
 
   function addToTicket(p: Product, qty: number) {
     setTicket((t) => {
@@ -329,7 +443,7 @@ export default function POS() {
         <button className="btn" style={{ width: "100%", marginTop: 12 }} disabled={loginLoading || !supabaseConfigured} onClick={entrar}>
           {loginLoading ? "Entrando…" : "Entrar"}
         </button>
-        <p className="muted" style={{ marginTop: 12 }}>Sin registro en la app: tu cuenta la crea el administrador en Supabase Auth.</p>
+        <p className="muted" style={{ marginTop: 12 }}>Sin registro en la app: tu cuenta la crea el administrador desde la pestaña Usuarios.</p>
       </div>
     );
   }
@@ -338,13 +452,13 @@ export default function POS() {
     <div style={{ ["--accent" as any]: settings.main_color || "#c2410c" }}>
       <header>
         <div><h1>{settings.logo_emoji} {settings.business_name}</h1><p>{settings.slogan} · Punto de venta</p></div>
-        <div style={{ textAlign: "right" }}><p>{supabaseConfigured ? "● Conectado a Supabase" : "○ Sin conexión a Supabase"}</p><p>{loading ? "Cargando…" : `${products.length} productos · ${sales.length} ventas`}</p><p className="muted">{user?.email}</p><button className="btn sec" onClick={salir}>Cerrar sesión</button></div>
+        <div style={{ textAlign: "right" }}><p>{supabaseConfigured ? "● Conectado a Supabase" : "○ Sin conexión a Supabase"}</p><p>{loading ? "Cargando…" : `${products.length} productos · ${sales.length} ventas`}</p><p className="muted">{user?.email} · {user?.role === "admin" ? "Admin" : "Cajero"}</p><button className="btn sec" onClick={salir}>Cerrar sesión</button></div>
       </header>
       {!supabaseConfigured && (
         <div className="banner">⚠️ Falta la llave anon de Supabase: el menú se muestra, pero las ventas no se guardan en la nube todavía. En Vercel agrega la variable <b>NEXT_PUBLIC_SUPABASE_ANON_KEY</b> con la llave “anon public” de Supabase (Settings → API) y vuelve a desplegar.</div>
       )}
       {supabaseConfigured && <div className="banner ok">✓ Conectado a Supabase: las ventas, los gastos y los cortes se guardan en la nube.</div>}
-      <nav>{visibleTabs.map((t) => (<button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t as any)}>{t}</button>))}</nav>
+      <nav>{visibleTabs.map((t) => (<button key={t} className={tab === t ? "on" : ""} onClick={() => setTab(t)}>{t}</button>))}</nav>
       <main>
         {msg && <p className="card" style={{ background: "#eff6ff" }}>{msg} <button className="btn sec" onClick={() => setMsg("")}>✕</button></p>}
 
@@ -573,6 +687,60 @@ export default function POS() {
                 <b>{l.action === "login" ? "Entrada" : l.action === "logout" ? "Salida" : l.action}</b>
               </div>
             ))}
+          </div>
+        )}
+
+        {tab === "Usuarios" && isAdmin && (
+          <div>
+            <h2>Usuarios</h2>
+            <p className="muted">Cuentas que pueden entrar al POS. Solo la ve la cuenta admin. Los usuarios nuevos entran con rol cajero por defecto.</p>
+            <button className="btn sec" onClick={cargarUsuarios} disabled={usersStatus === "loading"}>Actualizar</button>
+            {usersStatus === "no-service-key" && (
+              <p className="card" style={{ marginTop: 12 }}>⚠️ La gestión de usuarios aún no está activada: falta la variable <b>SUPABASE_SERVICE_ROLE_KEY</b> en Vercel. Sin ella no se pueden crear ni administrar usuarios desde aquí. Pasos en README.md (sección "Usuarios y roles"). El resto del POS sigue funcionando normal.</p>
+            )}
+            {usersStatus === "error" && (
+              <p className="card" style={{ marginTop: 12 }}>No se pudieron cargar los usuarios: {usersError || "revisa la configuración."}</p>
+            )}
+            {usersStatus === "loading" && <p className="muted">Cargando usuarios…</p>}
+            {usersStatus === "ok" && (
+              <>
+                <div className="card" style={{ marginTop: 12, marginBottom: 16 }}>
+                  <h2>Crear usuario</h2>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <input style={{ flex: 2, minWidth: 180 }} type="email" placeholder="Correo, ej. cajero@correo.com" value={nuevoUsuario.email} onChange={(e) => setNuevoUsuario({ ...nuevoUsuario, email: e.target.value })} />
+                    <input style={{ flex: 1, minWidth: 140 }} type="password" placeholder="Contraseña (mín. 6 caracteres)" value={nuevoUsuario.password} onChange={(e) => setNuevoUsuario({ ...nuevoUsuario, password: e.target.value })} />
+                    <select style={{ maxWidth: 130 }} value={nuevoUsuario.role} onChange={(e) => setNuevoUsuario({ ...nuevoUsuario, role: e.target.value })}>
+                      <option value="cajero">Cajero</option>
+                      <option value="admin">Admin</option>
+                    </select>
+                    <button className="btn" onClick={crearUsuario} disabled={usersBusy}>{usersBusy ? "Creando…" : "Crear usuario"}</button>
+                  </div>
+                  {usersError && <p style={{ color: "#b91c1c", marginTop: 8 }}>{usersError}</p>}
+                </div>
+                {appUsers.map((u) => {
+                  const bloqueado = !!u.banned_until && new Date(u.banned_until) > new Date();
+                  const esYo = u.id === user?.id;
+                  const esAdminPrincipal = (u.email || "").toLowerCase() === ADMIN_EMAIL;
+                  return (
+                    <div key={u.id} className="card" style={{ marginBottom: 10, opacity: bloqueado ? 0.6 : 1 }}>
+                      <div className="row">
+                        <span><b>{u.email || "Sin correo"}</b> · {u.role === "admin" ? "Admin" : "Cajero"}{bloqueado ? " · ⛔ Desactivado" : ""}{esYo ? " · (tú)" : ""}</span>
+                        <span className="muted">Creado: {new Date(u.created_at).toLocaleDateString("es-MX")} · Último acceso: {u.last_sign_in_at ? new Date(u.last_sign_in_at).toLocaleString("es-MX") : "nunca"}</span>
+                      </div>
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 8 }}>
+                        <select value={u.role} disabled={usersBusy || esYo || esAdminPrincipal} onChange={(e) => cambiarRolUsuario(u, e.target.value as "admin" | "cajero")}>
+                          <option value="cajero">Cajero</option>
+                          <option value="admin">Admin</option>
+                        </select>
+                        <button className="btn sec" disabled={usersBusy || esYo || esAdminPrincipal} onClick={() => toggleBloqueoUsuario(u)}>{bloqueado ? "Activar" : "Desactivar"}</button>
+                        <button className="btn sec" disabled={usersBusy || esYo || esAdminPrincipal} onClick={() => eliminarUsuario(u)}>Eliminar</button>
+                      </div>
+                    </div>
+                  );
+                })}
+                {!appUsers.length && <p className="muted">Sin usuarios todavía.</p>}
+              </>
+            )}
           </div>
         )}
       </main>

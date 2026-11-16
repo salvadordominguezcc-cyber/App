@@ -6,7 +6,7 @@ POS standalone de EL RODEO para usar fuera de Muse con link público.
 - Ventas: rejilla de productos, atajos de kilo ¼ / ½ / 1 kg, ticket, efectivo (con cambio) / tarjeta / transferencia, folio.
 - Catálogo: agregar, editar y quitar productos del menú. Sin stock: las ventas ya NO descuentan stock ni crean movimientos de inventario.
 - Gastos: registrar gastos del día (descripción, monto, categoría) y ver el total del día. Se descuentan del efectivo esperado en el corte de caja. Ver "Gastos" abajo.
-- Login por persona (Supabase Auth, email + contraseña) y bitácora de accesos (solo admin). Ver "Login y bitácora" abajo.
+- Login por persona (Supabase Auth, email + contraseña), bitácora de accesos (solo admin) y gestión de usuarios con roles admin / cajero (solo admin). Ver "Login y bitácora" y "Usuarios y roles" abajo.
 - Corte de caja: apertura con fondo, resumen por método de pago, esperado vs. contado, sobrante/faltante, historial.
 - Reportes: totales, ventas de hoy, ventas por producto.
 - Personalizar: nombre EL RODEO, eslogan, emoji de logo, color, tema, datos del negocio (dirección, teléfono, correo, RFC, horario, mensaje de ticket, fondo inicial).
@@ -21,6 +21,7 @@ Los ids de Supabase son uuid: la app nunca envía ids enteros como uuid (eso rom
 2. Variables de entorno (Production y Preview):
    - `NEXT_PUBLIC_SUPABASE_URL=https://hhrtiqdagnbdckdkoxih.supabase.co`
    - `NEXT_PUBLIC_SUPABASE_ANON_KEY=` ← la llave **"anon public"** de Supabase (Settings → API). Sin ella la app muestra el menú pero NO guarda ventas en la nube.
+   - `SUPABASE_SERVICE_ROLE_KEY=` ← la llave **"service_role"** de Supabase (Settings → API). Solo para la pestaña Usuarios; ver "Usuarios y roles" abajo. Sin prefijo `NEXT_PUBLIC`, tipo **Secret**, ámbito **Production**. Nunca se comparte por chat ni se pone como `NEXT_PUBLIC`.
 3. Desplegar (`npm run build` ya verificado en local).
 
 ## Gastos
@@ -85,13 +86,83 @@ create table if not exists public.access_log (
 alter table public.access_log disable row level security;
 ```
 
-### 2. Crear usuarios en Supabase Auth
+### 2. Crear usuarios
 
-Supabase → proyecto `el-rodeo-pos` → Authentication → Users → **Add user** →
-correo + contraseña → **Create user** (marca "Auto Confirm User" para que
-pueda entrar sin confirmar el correo). Repite por cada persona.
-El admin principal es `Salvadordominguezcc@gmail.com`; créalo igual que
-los demás, con su propia contraseña (nunca la compartas por chat).
+La forma normal es desde la pestaña **Usuarios** (solo admin, ver
+"Usuarios y roles" abajo). Como alternativa, también se pueden crear en
+Supabase → proyecto `el-rodeo-pos` → Authentication → Users →
+**Add user** → correo + contraseña → **Create user** (marca "Auto Confirm
+User" para que pueda entrar sin confirmar el correo). Repite por cada
+persona. El admin principal es `Salvadordominguezcc@gmail.com`; créalo
+igual que los demás, con su propia contraseña (nunca la compartas por
+chat). Los usuarios creados así, sin rol en su metadata, entran como
+cajero; el admin les puede subir el rol desde la pestaña Usuarios.
+
+## Usuarios y roles
+
+- Roles: **admin** y **cajero**. El rol se guarda en `user_metadata.role`
+  de Supabase Auth. El correo `Salvadordominguezcc@gmail.com` siempre es
+  admin aunque no tenga el metadata. Los usuarios nuevos se crean con
+  rol **cajero** por defecto.
+- Permisos por rol:
+  - **Cajero:** Ventas, Catálogo, Gastos, Corte de caja y Reportes.
+  - **Admin:** todo lo anterior + Personalizar, Bitácora y Usuarios.
+  - Si a un usuario le cambian el rol mientras está en una pestaña que
+    ya no ve (por ejemplo, un cajero que estaba en Personalizar), la app
+    lo regresa automáticamente a Ventas. El header muestra el rol junto
+    al correo ("Admin" / "Cajero").
+- Pestaña **Usuarios** (después de Personalizar, junto a Bitácora, solo
+  admin): lista todos los usuarios con correo, rol, fecha de creación y
+  último acceso. Acciones por usuario:
+  - **Crear usuario:** correo + contraseña (mín. 6 caracteres) + rol.
+    El correo queda confirmado de inmediato, así que el usuario ya puede
+    entrar sin confirmar por correo.
+  - **Cambiar rol:** selector Cajero / Admin por usuario.
+  - **Desactivar / Activar:** bloquea el acceso al POS (ban) o lo
+    reactiva. Un usuario desactivado no puede entrar aunque tenga su
+    contraseña.
+  - **Eliminar:** con confirmación; borra la cuenta de Supabase Auth.
+  - No se puede modificar ni eliminar la propia cuenta ni la del admin
+    principal desde la pestaña.
+  - Errores en español y en claro: correo duplicado ("Ya existe un
+    usuario con ese correo"), contraseña corta, sesión expirada, etc.
+
+### Por qué hace falta la llave service_role
+
+La llave anon del navegador **no puede** crear ni administrar usuarios
+de Supabase Auth. Por eso la gestión pasa por una API route del servidor
+(`app/api/users/route.ts`): el navegador solo manda su token de sesión
+(`Authorization: Bearer <access_token>`) y la ruta verifica con
+`supabase.auth.getUser` que quien llama sea admin (correo
+`Salvadordominguezcc@gmail.com` o `user_metadata.role === "admin"`) y
+rechaza con 403 a cualquiera que no lo sea. Solo entonces usa la llave
+service_role, que vive **únicamente del lado del servidor** y nunca se
+expone al cliente. Endpoints: `GET` lista, `POST` crear, `PATCH` cambiar
+rol / activar-desactivar, `DELETE` eliminar.
+
+### Agregar `SUPABASE_SERVICE_ROLE_KEY` en Vercel (solo el dueño)
+
+1. Supabase → proyecto `el-rodeo-pos` → **Settings → API** → copia la
+   llave **service_role** (la que dice "secret", NO la "anon public").
+   ⚠️ Esta llave tiene poder total sobre el proyecto: **nunca la
+   compartas por chat, correo ni capturas, y nunca la pongas como
+   `NEXT_PUBLIC_`** (eso la expondría en el navegador).
+2. Vercel → proyecto `el-rodeo-pos` → **Settings → Environment
+   Variables** → **Add New**:
+   - **Key:** `SUPABASE_SERVICE_ROLE_KEY`
+   - **Value:** la llave service_role copiada en el paso 1.
+   - **Type:** **Secret** (o "Sensitive").
+   - **Environment:** marca **Production** (y Preview si quieres
+     probarla en previews).
+   - **Save**.
+3. **Redeploy** el proyecto (Deployments → ⋯ → Redeploy) para que la
+   variable tome efecto.
+4. Entra al POS como admin y abre la pestaña **Usuarios**: ya debe
+   listar los usuarios.
+- Si la variable falta, la pestaña Usuarios muestra el aviso "falta la
+  variable SUPABASE_SERVICE_ROLE_KEY en Vercel" y el resto del POS sigue
+  funcionando normal (ventas, gastos, cortes, reportes y login no
+  dependen de ella).
 
 ## Estado
 - `npm run build` local: OK (Next.js 14.2.13, ruta `/` 71 kB).
