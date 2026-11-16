@@ -26,7 +26,6 @@ export const SEED_PRODUCTS: Product[] = [
 export const SEED_SETTINGS = {
   business_name: "EL RODEO",
   slogan: "Barbacoa",
-  logo_emoji: "🥩",
   logo_url: "",
   main_color: "#c2410c",
   theme: "claro",

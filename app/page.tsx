@@ -139,8 +139,8 @@ export default function POS() {
   const [isStandalone, setIsStandalone] = useState(false);
   const [installMsg, setInstallMsg] = useState("");
   // Logo del negocio (Personalizar, solo admin): imagen subida por el admin,
-  // guardada en settings.logo_url como data URL. El emoji (logo_emoji) queda
-  // solo como respaldo cuando no hay imagen subida.
+  // guardada en settings.logo_url como data URL. Sin imagen, se muestra el
+  // logo por defecto de EL RODEO (/icon.svg). Ya no hay opción de emoji.
   const [logoMsg, setLogoMsg] = useState("");
 
   const isAdmin = !!user && user.role === "admin";
@@ -944,7 +944,7 @@ async function load() {
     guardarSettingsLocal(settings);
     if (supabase) {
       const { error } = await supabase.from("settings").update({
-        business_name: settings.business_name, slogan: settings.slogan, logo_emoji: settings.logo_emoji,
+        business_name: settings.business_name, slogan: settings.slogan,
         logo_url: settings.logo_url || null,
         main_color: settings.main_color, theme: settings.theme, address: settings.address, phone: settings.phone,
         whatsapp: settings.whatsapp, email: settings.email, rfc: settings.rfc, hours: settings.hours,
@@ -1246,7 +1246,7 @@ async function load() {
                 <button className="btn sec" onClick={quitarLogo}>Quitar imagen</button>
               </div>
             ) : (
-              <p className="muted">Sin imagen subida: se muestra el logo por defecto {settings.logo_emoji || "🥩"}.</p>
+              <p className="muted">Sin imagen subida: se muestra el logo por defecto de EL RODEO.</p>
             )}
             <input type="file" accept="image/jpeg,image/png,image/webp" onChange={onLogoFile} />
             <p className="muted">JPG, PNG o WebP (máx. 10 MB). Se comprime a 512×512 px y menos de 200 KB. Recuerda pulsar “Guardar datos del negocio”. El icono de la app instalada en el celular no cambia desde aquí: es un archivo fijo de la app.</p>
