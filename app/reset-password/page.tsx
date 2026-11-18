@@ -8,7 +8,9 @@ import { supabase, supabaseConfigured } from "../../lib/supabase";
 // enlace válido de recuperación. Si el enlace expiró o es inválido,
 // muestra el error y un enlace para pedir otro desde el login.
 // Requiere que en Supabase Auth → URL Configuration esté agregada
-// como Redirect URL: https://el-rodeo-pos.vercel.app/reset-password
+// como Redirect URL la URL de reset de tu dominio actual, por ejemplo
+// https://el-rodeo-pos.pages.dev/reset-password (o la de Vercel si
+// sigues ahí).
 export default function ResetPassword() {
   const [status, setStatus] = useState<"checking" | "ready" | "invalid" | "done">("checking");
   const [error, setError] = useState("");
@@ -20,7 +22,7 @@ export default function ResetPassword() {
     (async () => {
       if (!supabase || !supabaseConfigured) {
         setStatus("invalid");
-        setError("Supabase no está conectado: falta la llave anon en Vercel.");
+        setError("Supabase no está conectado: falta la llave anon en el despliegue.");
         return;
       }
       // Flujo PKCE: el enlace trae ?code=… y se intercambia por sesión.

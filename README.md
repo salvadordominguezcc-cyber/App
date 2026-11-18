@@ -1,4 +1,4 @@
-# EL RODEO — Punto de Venta (Next.js + Supabase + Vercel)
+# EL RODEO — Punto de Venta (Next.js + Supabase + Cloudflare Pages)
 
 POS standalone de EL RODEO para usar fuera de Muse con link público.
 
@@ -19,7 +19,116 @@ Supabase, proyecto `el-rodeo-pos` — https://hhrtiqdagnbdckdkoxih.supabase.co
 Tablas: products (7 productos reales), sales, sale_items, inventory_movements, cash_cuts, settings, access_log, expenses.
 Los ids de Supabase son uuid: la app nunca envía ids enteros como uuid (eso rompía la sincronización del POS de Muse con error 22P02); deja que Supabase genere los uuid de ventas/renglones/movimientos/cortes y usa el uuid real devuelto al insertar.
 
+## Despliegue en Cloudflare Pages
+
+Despliegue actual: **Cloudflare Pages** (plan gratis, uso comercial
+permitido). Supabase no cambia: mismo proyecto `el-rodeo-pos`, mismas
+tablas, mismas llaves.
+
+### Qué se instaló y por qué
+
+- **`@cloudflare/next-on-pages@1.13.15`** (devDependency): adapter que
+  convierte el build de Next.js en una salida que Cloudflare Pages
+  puede servir (páginas estáticas + la ruta `/api/users` como Edge
+  Function de Workers). Se fijó la versión **1.13.15** porque las
+  versiones más nuevas exigen Next.js ≥ 14.3.0, que no existe en la
+  línea 14 (la app usa Next 14.2.13). ⚠️ El paquete está **deprecado**
+  por Cloudflare (en mantenimiento desde finales de 2025): la
+  recomendación oficial actual es el adapter **OpenNext**
+  (`@opennextjs/cloudflare`, despliegue en Workers). Si algún día
+  next-on-pages deja de funcionar con una versión nueva de Next.js, el
+  camino es migrar a OpenNext; el código de la app no tendría que
+  cambiar (solo el adapter y el build).
+- **`wrangler@3`** (devDependency): CLI de Cloudflare para desplegar
+  y probar en local (`wrangler pages dev` / `wrangler pages deploy`).
+- **`wrangler.toml`**: nombre del proyecto (`el-rodeo-pos`), fecha de
+  compatibilidad `2025-07-18` y flag `nodejs_compat` (necesario para
+  que supabase-js corra en el runtime edge), y
+  `pages_build_output_dir = ".vercel/output/static"`.
+- **`app/api/users/route.ts`**: ahora exporta `export const runtime =
+  "edge"` (obligatorio: sin él Next.js usaría el runtime Node.js y el
+  despliegue en Cloudflare fallaría). La lógica no cambió: solo el
+  admin (verificación con token, 403 a no-admins), la llave
+  service_role solo del lado del servidor, leída con `process.env`
+  (Cloudflare Pages la inyecta en el runtime edge). La resolución
+  pública `GET ?username=` conserva su límite de 20 intentos/min por
+  IP (en memoria por instancia).
+- **`app/page.tsx`**: la recuperación de contraseña ya no lleva fija
+  la URL de Vercel: usa `window.location.origin + "/reset-password"`,
+  así funciona igual en Vercel y en Cloudflare. Los mensajes de error
+  que decían "en Vercel" ahora dicen "en Cloudflare".
+- **`.gitignore`**: se agregó `.vercel/` (salida del build de
+  next-on-pages, no se sube al repo).
+
+### Build local para Cloudflare
+
+```bash
+npm run build:cloudflare   # next build && npx @cloudflare/next-on-pages
+```
+
+Verificado: build OK (Next.js 14.2.13; 1 Edge Function `/api/users`,
+rutas prerenderizadas `/` y `/reset-password`, salida en
+`.vercel/output/static` con `_worker.js`). Prueba local con
+`npx wrangler pages dev .vercel/output/static --port 8788`: la página
+`/` responde 200 y `/api/users` responde 403 sin token (y el error
+genérico de login en `?username=`, porque sin llaves no hay cliente
+admin) — el worker arranca y supabase-js corre en el runtime edge.
+La verificación en vivo (con llaves reales y dominio `pages.dev`)
+queda pendiente de crear el proyecto en el panel de Cloudflare.
+
+### Pasos en el panel de Cloudflare
+
+1. Crear cuenta en https://dash.cloudflare.com (gratis, sin tarjeta).
+2. **Workers & Pages → Create → Pages → Connect to Git** → conecta
+   GitHub y elige el repo `salvadordominguezcc-cyber/App`, rama `main`.
+3. Configuración del proyecto:
+   - **Project name:** `el-rodeo-pos` (queda en
+     `https://el-rodeo-pos.pages.dev`).
+   - **Framework preset:** Next.js (o "None" si el preset no aparece;
+     lo importante es el comando de build).
+   - **Build command:** `npm run build:cloudflare`
+   - **Build output directory:** `.vercel/output/static`
+   - **Root directory:** `/` (el repo tiene el proyecto en la raíz).
+   - **Node.js version:** 20 o mayor (el build local usa Node 24).
+4. **Settings → Functions → Compatibility Flags:** activar
+   **`nodejs_compat`** para Production y Preview. **Compatibility
+   Date:** `2025-07-18` o mayor.
+5. **Settings → Environment Variables** (Production y Preview):
+   - `NEXT_PUBLIC_SUPABASE_URL=https://hhrtiqdagnbdckdkoxih.supabase.co`
+   - `NEXT_PUBLIC_SUPABASE_ANON_KEY=` ← llave **"anon public"** de
+     Supabase (Settings → API). Sin ella la app muestra el menú pero
+     NO guarda ventas en la nube.
+   - `SUPABASE_SERVICE_ROLE_KEY=` ← llave **"service_role"** de
+     Supabase (Settings → API). Solo para la pestaña Usuarios; ver
+     "Usuarios y roles" abajo. Sin prefijo `NEXT_PUBLIC`, como
+     **secreto**. Nunca se comparte por chat ni se pone como
+     `NEXT_PUBLIC`.
+6. **Save and Deploy.** Cada push a `main` en GitHub redespliega solo.
+7. En Supabase → proyecto `el-rodeo-pos` → **Authentication → URL
+   Configuration → Redirect URLs**, agregar la URL de reset del
+   dominio nuevo: `https://el-rodeo-pos.pages.dev/reset-password`
+   (la de Vercel puede quedarse o quitarse). Sin ella, el enlace de
+   "¿Olvidaste tu contraseña?" no vuelve a la app.
+8. Opcional: despliegue manual desde local (requiere `wrangler login`
+   con la cuenta de Cloudflare):
+   `npm run deploy:cloudflare`
+
+### Límites del plan gratis de Cloudflare (lo que pediría pago)
+
+- Visitas y ancho de banda de la parte estática: **ilimitados**, nunca
+  se cobran. El plan gratis permite uso comercial.
+- La ruta `/api/users` (Pages Function) comparte el límite de Workers
+  gratis: **100,000 peticiones por día**. Solo se usa al gestionar
+  usuarios y al entrar con nombre de usuario; con el volumen de EL
+  RODEO no se llega. Si se pasara, el siguiente paso es Workers Paid
+  ($5/mes).
+- **500 builds al mes** (despliegues por push a GitHub). Si se pasara,
+  el siguiente paso es el plan Pro ($20/mes).
+
 ## Despliegue en Vercel
+
+Despliegue anterior (la app vivió ahí hasta el 2026-11-17; el código
+sigue siendo compatible, pero el objetivo actual es Cloudflare Pages).
 1. Crear el proyecto `el-rodeo-pos` (framework Next.js).
 2. Variables de entorno (Production y Preview):
    - `NEXT_PUBLIC_SUPABASE_URL=https://hhrtiqdagnbdckdkoxih.supabase.co`
@@ -316,9 +425,12 @@ cajero; el admin les puede subir el rol desde la pestaña Usuarios.
 - En la pantalla de login, debajo de "Entrar", el enlace
   **"¿Olvidaste tu contraseña?"** abre un formulario donde se escribe
   el correo y se pulsa "Enviar enlace de recuperación". Usa
-  `resetPasswordForEmail` con redirección a
-  `https://el-rodeo-pos.vercel.app/reset-password` (esa URL debe estar
-  agregada en Supabase Auth → URL Configuration → Redirect URLs).
+  `resetPasswordForEmail` con redirección al dominio actual
+  (`window.location.origin + "/reset-password"`), así funciona igual
+  en Vercel y en Cloudflare. La URL completa
+  `https://el-rodeo-pos.pages.dev/reset-password` (o la de Vercel si
+  sigues ahí) debe estar agregada en Supabase Auth → URL
+  Configuration → Redirect URLs.
 - El mensaje de éxito es genérico a propósito ("Si ese correo tiene
   cuenta, te enviamos un enlace…") y no revela si el correo existe.
 - La página **`/reset-password`** es pública y solo sirve con un
@@ -348,7 +460,19 @@ resuelve un usuario a su correo (público, limitado), `POST` crear,
 `PATCH` cambiar rol / activar-desactivar / nombre de usuario,
 `DELETE` eliminar.
 
-### Agregar `SUPABASE_SERVICE_ROLE_KEY` en Vercel (solo el dueño)
+### Agregar `SUPABASE_SERVICE_ROLE_KEY` en Cloudflare (solo el dueño)
+
+En Cloudflare Pages la llave va en **Settings → Environment
+Variables** del proyecto `el-rodeo-pos`: **Add variable** con Key
+`SUPABASE_SERVICE_ROLE_KEY`, Value la llave service_role copiada de
+Supabase (Settings → API, la que dice "secret", NO la "anon public"),
+marcada como **Secret/Encrypted** y para **Production** (y Preview si
+se quiere probar en previews). Después, **redeploy** (Deployments →
+⋯ → Retry deployment) para que tome efecto. ⚠️ Nunca la compartas por
+chat, correo ni capturas, y nunca la pongas como `NEXT_PUBLIC_` (eso
+la expondría en el navegador).
+
+### Agregar `SUPABASE_SERVICE_ROLE_KEY` en Vercel (solo el dueño, despliegue anterior)
 
 1. Supabase → proyecto `el-rodeo-pos` → **Settings → API** → copia la
    llave **service_role** (la que dice "secret", NO la "anon public").
@@ -374,4 +498,12 @@ resuelve un usuario a su correo (público, limitado), `POST` crear,
 
 ## Estado
 - `npm run build` local: OK (Next.js 14.2.13, ruta `/` 71 kB).
+- `npm run build:cloudflare` local: OK (2026-11-17, Next.js 14.2.13 +
+  @cloudflare/next-on-pages 1.13.15; 1 Edge Function `/api/users`,
+  rutas `/` y `/reset-password` prerenderizadas, salida en
+  `.vercel/output/static`). Prueba local con `wrangler pages dev`:
+  `/` responde 200 y `/api/users` responde 403 sin token — el worker
+  arranca bien. Falta la verificación en vivo con el proyecto creado
+  en el panel de Cloudflare (cuenta, repo conectado, variables y
+  Redirect URL en Supabase).
 - Despliegue en Vercel: BLOQUEADO el 2026-11-15 — la API de Vercel devuelve 403 "Not authorized" para el scope `salvadordominguezcc-7032` (team `team_vIRmW5ilBsFZoFpkpsMMMJgK`) en `list_projects`, `create_project` y `get_project`. La recuperación indicada es `authorize_team_access`, herramienta que no está disponible en este conector; refrescar el token no lo resolvió. Hace falta que el usuario apruebe el acceso del equipo en Vercel y se reintente el despliegue.

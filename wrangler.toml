@@ -1,0 +1,18 @@
+# Cloudflare Pages — POS EL RODEO
+#
+# Nombre del proyecto en Cloudflare Pages (será
+# https://el-rodeo-pos.pages.dev salvo que se ponga un dominio propio).
+name = "el-rodeo-pos"
+
+# Fecha de compatibilidad del runtime de Workers. El flag nodejs_compat
+# es necesario para que @cloudflare/next-on-pages (y supabase-js, que
+# corre en la ruta /api/users) puedan usar APIs de Node.js dentro del
+# runtime edge. En el panel de Cloudflare, Settings → Functions →
+# Compatibility Flags, debe estar también activado `nodejs_compat`
+# para Production y Preview.
+compatibility_date = "2025-07-18"
+compatibility_flags = ["nodejs_compat"]
+
+# Salida que genera `npx @cloudflare/next-on-pages` (ver package.json,
+# script "build:cloudflare"). Es lo que Cloudflare Pages publica.
+pages_build_output_dir = ".vercel/output/static"

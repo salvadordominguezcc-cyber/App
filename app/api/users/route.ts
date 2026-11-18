@@ -1,13 +1,21 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
+// La ruta corre en el runtime edge de Cloudflare Workers (Cloudflare
+// Pages): sin este export, Next.js usaría el runtime Node.js y el
+// despliegue en Cloudflare fallaría. Las variables de entorno del
+// servidor (SUPABASE_SERVICE_ROLE_KEY y las NEXT_PUBLIC_*) se leen
+// igual con process.env: Cloudflare Pages las inyecta en el runtime
+// edge de next-on-pages.
+export const runtime = "edge";
+
 // Gestión de usuarios de EL RODEO — SOLO lado del servidor.
 //
 // La llave service_role NUNCA sale del servidor: vive en la variable de
-// entorno SUPABASE_SERVICE_ROLE_KEY (sin prefijo NEXT_PUBLIC, tipo Secret
-// en Vercel) y solo la lee esta ruta. El navegador jamás la ve ni la
-// recibe. La llave anon no puede crear ni administrar usuarios de Auth,
-// por eso esta gestión no se hace desde el cliente.
+// entorno SUPABASE_SERVICE_ROLE_KEY (sin prefijo NEXT_PUBLIC, como
+// secreto en Cloudflare Pages) y solo la lee esta ruta. El navegador
+// jamás la ve ni la recibe. La llave anon no puede crear ni administrar
+// usuarios de Auth, por eso esta gestión no se hace desde el cliente.
 //
 // Seguridad: cada petición trae el access token del usuario que llama
 // (header Authorization: Bearer <token>). La ruta verifica ese token con
@@ -61,7 +69,7 @@ function serviceKeyMissing() {
     {
       code: "SERVICE_ROLE_MISSING",
       message:
-        "Falta configurar SUPABASE_SERVICE_ROLE_KEY en Vercel (Settings → Environment Variables, tipo Secret, ámbito Production). Sin ella no se pueden administrar usuarios desde el POS.",
+        "Falta configurar SUPABASE_SERVICE_ROLE_KEY en Cloudflare Pages (Settings → Environment Variables, como secreto, ámbito Production). Sin ella no se pueden administrar usuarios desde el POS.",
     },
     { status: 503 },
   );

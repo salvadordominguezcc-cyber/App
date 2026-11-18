@@ -514,7 +514,7 @@ async function load() {
   // SOLO el correo y el mismo error genérico si no existe, para no revelar
   // si un usuario existe). La contraseña nunca viaja a esa ruta.
   async function entrar() {
-    if (!supabase) { setLoginError("Supabase no está conectado: falta la llave anon en Vercel."); return; }
+    if (!supabase) { setLoginError("Supabase no está conectado: falta la llave anon en Cloudflare."); return; }
     if (!loginEmail.trim() || !loginPass) { setLoginError("Escribe tu correo o nombre de usuario y tu contraseña."); return; }
     setLoginLoading(true);
     setLoginError("");
@@ -564,7 +564,7 @@ async function load() {
   // entran solo con nombre de usuario (correo interno @elrodeo.local)
   // no reciben correo: ellos piden su nueva contraseña al admin.
   async function pedirRecuperacion() {
-    if (!supabase) { setRecoveryError("Supabase no está conectado: falta la llave anon en Vercel."); return; }
+    if (!supabase) { setRecoveryError("Supabase no está conectado: falta la llave anon en Cloudflare."); return; }
     const email = recoveryEmail.trim().toLowerCase();
     if (!email.includes("@") || email.includes(" ") || email.length < 5) {
       setRecoveryError("Escribe un correo válido, por ejemplo tu@correo.com.");
@@ -573,8 +573,12 @@ async function load() {
     setRecoveryLoading(true);
     setRecoveryError("");
     setRecoveryMsg("");
+    // La redirección usa el dominio actual (window.location.origin), así
+    // funciona igual en Vercel y en Cloudflare Pages. Esa URL completa
+    // (.../reset-password) debe estar agregada en Supabase Auth →
+    // URL Configuration → Redirect URLs.
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: "https://el-rodeo-pos.vercel.app/reset-password",
+      redirectTo: window.location.origin + "/reset-password",
     });
     setRecoveryLoading(false);
     if (error) {
@@ -1048,7 +1052,7 @@ async function load() {
         <h1><img src="/icon.svg" alt="Logo de EL RODEO" style={{ width: 48, height: 48, objectFit: "cover", borderRadius: "50%", verticalAlign: "middle", marginRight: 8 }} />{SEED_SETTINGS.business_name}</h1>
         <p className="muted">Punto de venta · Entra con tu correo o tu nombre de usuario y tu contraseña.</p>
         {!supabaseConfigured && (
-          <p className="banner">⚠️ Supabase no está conectado: falta la llave anon en Vercel. Sin conexión no se puede iniciar sesión.</p>
+          <p className="banner">⚠️ Supabase no está conectado: falta la llave anon en Cloudflare. Sin conexión no se puede iniciar sesión.</p>
         )}
         <label>Correo o nombre de usuario</label>
         <input type="text" value={loginEmail} onChange={(e) => setLoginEmail(e.target.value)} placeholder="tu@correo.com o tu usuario" onKeyDown={(e) => { if (e.key === "Enter") entrar(); }} />
@@ -1103,7 +1107,7 @@ async function load() {
         </div>
       </header>
       {!supabaseConfigured && (
-        <div className="banner">⚠️ Falta la llave anon de Supabase: el menú se muestra, pero las ventas no se guardan en la nube todavía. En Vercel agrega la variable <b>NEXT_PUBLIC_SUPABASE_ANON_KEY</b> con la llave “anon public” de Supabase (Settings → API) y vuelve a desplegar.</div>
+        <div className="banner">⚠️ Falta la llave anon de Supabase: el menú se muestra, pero las ventas no se guardan en la nube todavía. En Cloudflare agrega la variable <b>NEXT_PUBLIC_SUPABASE_ANON_KEY</b> con la llave “anon public” de Supabase (Settings → API) y vuelve a desplegar.</div>
       )}
       {supabaseConfigured && <div className="banner ok">✓ Conectado a Supabase: las ventas, los gastos y los cortes se guardan en la nube.</div>}
       {!online && (
@@ -1457,7 +1461,7 @@ async function load() {
             <p className="muted">Cuentas que pueden entrar al POS. Solo la ve la cuenta admin. Los usuarios nuevos entran con rol cajero por defecto.</p>
             <button className="btn sec" onClick={cargarUsuarios} disabled={usersStatus === "loading"}>Actualizar</button>
             {usersStatus === "no-service-key" && (
-              <p className="card" style={{ marginTop: 12 }}>⚠️ La gestión de usuarios aún no está activada: falta la variable <b>SUPABASE_SERVICE_ROLE_KEY</b> en Vercel. Sin ella no se pueden crear ni administrar usuarios desde aquí. Pasos en README.md (sección "Usuarios y roles"). El resto del POS sigue funcionando normal.</p>
+              <p className="card" style={{ marginTop: 12 }}>⚠️ La gestión de usuarios aún no está activada: falta la variable <b>SUPABASE_SERVICE_ROLE_KEY</b> en Cloudflare. Sin ella no se pueden crear ni administrar usuarios desde aquí. Pasos en README.md (sección "Usuarios y roles"). El resto del POS sigue funcionando normal.</p>
             )}
             {usersStatus === "error" && (
               <p className="card" style={{ marginTop: 12 }}>No se pudieron cargar los usuarios: {usersError || "revisa la configuración."}</p>
