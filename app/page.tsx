@@ -925,6 +925,87 @@ async function load() {
     gastos: gastosHoy.filter((e) => e.pending).reduce((s, x) => s + x.amount_cents, 0),
   }), [ventasHoy, gastosHoy]);
 
+  // --- Exportación a CSV para Google Sheets (pestaña Reportes) ---
+  // Usa solo los datos ya cargados en la app (ventas, cortes y gastos);
+  // no hace llamadas nuevas a Supabase. El CSV lleva BOM UTF-8 para que
+  // los acentos se vean bien en Sheets, y comillas en los campos con comas.
+  function csvCelda(v: string | number): string {
+    const s = String(v ?? "");
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }
+  function fechaHoraLocal(iso: string): string {
+    const d = new Date(iso);
+    const fecha = d.toLocaleDateString("en-CA", { timeZone: "America/Tijuana" });
+    const hora = d.toLocaleTimeString("es-MX", { timeZone: "America/Tijuana", hour: "2-digit", minute: "2-digit", hour12: false });
+    return `${fecha} ${hora}`;
+  }
+  function pesos(cents: number): string {
+    return (Number(cents || 0) / 100).toFixed(2);
+  }
+  function descargarArchivo(nombre: string, contenido: string) {
+    const blob = new Blob(["\ufeff" + contenido], { type: "text/csv;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = nombre;
+    document.body.appendChild(a); a.click(); a.remove();
+    URL.revokeObjectURL(url);
+  }
+  // Detalle de ventas, un renglón por producto vendido: folio, fecha y
+  // hora, total, método de pago, quién vendió, estado, producto, cantidad,
+  // precio unitario y subtotal. Las ventas offline salen con folio
+  // "Pendiente" y estado "Pendiente de sincronizar".
+  const ENCABEZADO_VENTAS = ["Folio", "Fecha y hora", "Total ($)", "Método de pago", "Quién vendió", "Estado", "Producto", "Cantidad", "Precio unitario ($)", "Subtotal ($)"];
+  function filasVentasDetalle(): string[][] {
+    const filas: string[][] = [];
+    for (const s of sales) {
+      const quien = s.sold_by_name || s.sold_by_email || "Sin registro";
+      const estado = s.pending ? "Pendiente de sincronizar" : "Sincronizada";
+      const folio = s.folio != null ? String(s.folio) : "Pendiente";
+      const items = s.items && s.items.length ? s.items : [{ product_name: "", quantity: 0, subtotal_cents: 0 }];
+      for (const i of items) {
+        const precio = i.quantity ? Number(i.subtotal_cents) / Number(i.quantity) : 0;
+        filas.push([folio, fechaHoraLocal(s.created_at), pesos(s.total_cents), s.payment_method, quien, estado, i.product_name, String(i.quantity), pesos(precio), pesos(i.subtotal_cents)]);
+      }
+    }
+    return filas;
+  }
+  function descargarCSVVentas() {
+    if (!sales.length) { setMsg("Sin ventas para exportar todavía."); return; }
+    const texto = [ENCABEZADO_VENTAS, ...filasVentasDetalle()].map((f) => f.map(csvCelda).join(",")).join("\n");
+    descargarArchivo("ventas-el-rodeo.csv", texto);
+    setMsg(`CSV de ventas descargado (${sales.length} ${sales.length === 1 ? "venta" : "ventas"}). Ábrelo en Google Sheets: Archivo → Importar.`);
+  }
+  function descargarCSVCortes() {
+    if (!cuts.length) { setMsg("Sin cortes para exportar todavía."); return; }
+    const encabezado = ["Fecha y hora", "Fondo inicial ($)", "Ventas en efectivo ($)", "Gastos del día ($)", "Efectivo esperado ($)", "Efectivo contado ($)", "Diferencia ($)", "Estado"];
+    const filas = cuts.map((c) => {
+      // Ventas en efectivo y gastos del día del corte, calculados con los
+      // datos ya cargados en la app (últimas 50 ventas y 100 gastos).
+      const dia = localDay(c.created_at);
+      const ventasEfectivo = sales.filter((s) => localDay(s.created_at) === dia && s.payment_method === "efectivo").reduce((a, x) => a + x.total_cents, 0);
+      const gastosDia = expenses.filter((e) => localDay(e.created_at) === dia).reduce((a, x) => a + x.amount_cents, 0);
+      return [fechaHoraLocal(c.created_at), pesos(c.opening_cents), pesos(ventasEfectivo), pesos(gastosDia), pesos(c.expected_cents), pesos(c.counted_cents), pesos(c.difference_cents), c.status + (c.pending ? " (pendiente de sincronizar)" : "")];
+    });
+    const texto = [encabezado, ...filas].map((f) => f.map(csvCelda).join(",")).join("\n");
+    descargarArchivo("cortes-el-rodeo.csv", texto);
+    setMsg(`CSV de cortes descargado (${cuts.length} ${cuts.length === 1 ? "corte" : "cortes"}). Ábrelo en Google Sheets: Archivo → Importar.`);
+  }
+  async function copiarVentasTSV() {
+    if (!sales.length) { setMsg("Sin ventas para copiar todavía."); return; }
+    const texto = [ENCABEZADO_VENTAS, ...filasVentasDetalle()].map((f) => f.join("\t")).join("\n");
+    try {
+      await navigator.clipboard.writeText(texto);
+      setMsg(`Ventas copiadas (${sales.length} ${sales.length === 1 ? "venta" : "ventas"}). Pégalas en Google Sheets con Ctrl+V.`);
+    } catch {
+      // Fallback para navegadores sin permiso de portapapeles.
+      const ta = document.createElement("textarea");
+      ta.value = texto; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); setMsg("Ventas copiadas. Pégalas en Google Sheets con Ctrl+V."); }
+      catch { setMsg("No se pudo copiar al portapapeles."); }
+      ta.remove();
+    }
+  }
+
   async function cerrarCorte() {
     const counted = Math.round(parseFloat(contado || "0") * 100);
     const tempId = crypto.randomUUID();
@@ -1358,6 +1439,13 @@ async function load() {
               <div className="card"><div className="muted">Ventas totales</div><div className="big">{fmt(totalVentas)}</div></div>
               <div className="card"><div className="muted">Ventas hoy</div><div className="big">{fmt(ventasHoy.reduce((s, x) => s + x.total_cents, 0))}</div><div className="muted">{ventasHoy.length} ventas</div></div>
               <div className="card"><div className="muted">Productos activos</div><div className="big">{products.filter((p) => p.active).length}</div></div>
+            </div>
+            <h2 style={{ marginTop: 20 }}>Exportar para Google Sheets</h2>
+            <p className="muted">Descarga los datos en CSV y ábrelos en Google Sheets (Archivo → Importar), o copia las ventas y pégalas directo en una hoja. Las ventas pendientes de sincronizar se marcan como “Pendiente de sincronizar”.</p>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button className="btn" onClick={descargarCSVVentas} disabled={!sales.length}>Descargar CSV de ventas</button>
+              <button className="btn" onClick={descargarCSVCortes} disabled={!cuts.length}>Descargar CSV de cortes</button>
+              <button className="btn sec" onClick={copiarVentasTSV} disabled={!sales.length}>Copiar ventas (para Sheets)</button>
             </div>
             <h2 style={{ marginTop: 20 }}>Ventas por producto</h2>
             {products.map((p) => {
